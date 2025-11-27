@@ -1,9 +1,10 @@
-# config.py — PPO for Protein MD (final)
+import os
 import time
 import openmm
 from openmm import unit
 
 SEED = 42
+
 
 def get_best_platform():
     names = [openmm.Platform.getPlatform(i).getName()
@@ -17,6 +18,7 @@ def get_best_platform():
         return openmm.Platform.getPlatformByName('OpenCL')
     print("Using CPU platform")
     return openmm.Platform.getPlatformByName('CPU')
+
 
 platform = get_best_platform()
 
@@ -33,8 +35,8 @@ ATOM_PAIRS = []
 
 # ---- Targets
 CURRENT_DISTANCE = 3.3
-FINAL_TARGET     = 7.5
-TARGET_CENTER          = FINAL_TARGET
+FINAL_TARGET = 7.5
+TARGET_CENTER = FINAL_TARGET
 TARGET_ZONE_HALF_WIDTH = 0.35
 TARGET_MIN = TARGET_CENTER - TARGET_ZONE_HALF_WIDTH
 TARGET_MAX = TARGET_CENTER + TARGET_ZONE_HALF_WIDTH
@@ -45,30 +47,30 @@ DISTANCE_INCREMENTS = [3.5, 3.8, 4.2, 5.0, 6.0, 7.0]
 # ---- Locks / confinement
 ENABLE_MILESTONE_LOCKS = False         # final training: no hard locks
 LOCK_MARGIN = 0.15
-BACKSTOP_K  = 3.0e4
+BACKSTOP_K = 3.0e4
 
 PERSIST_LOCKS_ACROSS_EPISODES = True
-CARRY_STATE_ACROSS_EPISODES   = True
+CARRY_STATE_ACROSS_EPISODES = True
 
-FREEZE_EXPLORATION_AT_ZONE    = False  # do not freeze exploration
+FREEZE_EXPLORATION_AT_ZONE = False  # do not freeze exploration
 
 ZONE_CONFINEMENT = True
 ZONE_K = 8.0e4
-ZONE_MARGIN_LOW  = 0.05
+ZONE_MARGIN_LOW = 0.05
 ZONE_MARGIN_HIGH = 0.05
 SEED_ZONE_CAP_IF_BEST_IN_ZONE = True
 
 # ---- Observation/action
 STATE_SIZE = 8
-AMP_BINS    = [0.0, 4.0, 8.0, 12.0, 16.0]
-WIDTH_BINS  = [0.3, 0.5, 0.7, 1.0]
+AMP_BINS = [0.0, 4.0, 8.0, 12.0, 16.0]
+WIDTH_BINS = [0.3, 0.5, 0.7, 1.0]
 OFFSET_BINS = [0.1, 0.2, 0.5, 1.0, 1.5]      # added 0.1 for finer Phase-2
 ACTION_SIZE = len(AMP_BINS) * len(WIDTH_BINS) * len(OFFSET_BINS)
 
-MIN_AMP, MAX_AMP      = 0.0, 40.0
-MIN_WIDTH, MAX_WIDTH  = 0.1, 2.5
+MIN_AMP, MAX_AMP = 0.0, 40.0
+MIN_WIDTH, MAX_WIDTH = 0.1, 2.5
 MAX_ESCALATION_FACTOR = 1.5
-IN_ZONE_MAX_AMP       = 1e9               # no mask in zone for final training
+IN_ZONE_MAX_AMP = 1e9               # no mask in zone for final training
 
 # ===================== PPO ================================
 N_STEPS = 8
@@ -85,14 +87,13 @@ PPO_TARGET_KL = 0.03
 
 # ===================== Episode & MD =======================
 MAX_ACTIONS_PER_EPISODE = 16
-stepsize  = 0.001 * unit.picoseconds      # safer integrator
-fricCoef  = 2.0  / unit.picoseconds
+stepsize = 0.001 * unit.picoseconds      # safer integrator
+fricCoef = 2.0 / unit.picoseconds
 # --- thermostat temperature ---
 T = 300 * unit.kelvin
 
-
 propagation_step = 3000                    # total integrator steps per action
-dcdfreq_mfpt     = 40                      # save interval
+dcdfreq_mfpt = 40                          # save interval
 
 # NaN recovery
 MAX_INTEGRATOR_RETRIES = 2
@@ -100,14 +101,14 @@ MIN_STEPSIZE = 0.0005 * unit.picoseconds
 
 # ===================== Rewards ===========================
 # Phase-1
-PROGRESS_REWARD   = 120.0       # per Å outward this step
-MILESTONE_REWARD  = 200.0
+PROGRESS_REWARD = 120.0       # per Å outward this step
+MILESTONE_REWARD = 200.0
 BACKTRACK_PENALTY = -15.0
-VELOCITY_BONUS    = 10.0
-STEP_PENALTY      = -0.5
+VELOCITY_BONUS = 10.0
+STEP_PENALTY = -0.5
 # Phase-2
-PHASE2_TOL      = 0.08
-CENTER_GAIN     = 400.0
+PHASE2_TOL = 0.08
+CENTER_GAIN = 400.0
 STABILITY_STEPS = 6
 CONSISTENCY_BONUS = 50.0
 
@@ -117,16 +118,31 @@ EVAL_EVERY = 5
 N_EVAL_EPISODES = 3
 SAVE_CHECKPOINT_EVERY = 5
 RESULTS_DIR = "results_PPO"
-PLOTS_DIR   = "plots"
+PLOTS_DIR = "plots"
 METRICS_CSV = f"{RESULTS_DIR}/training_metrics.csv"
 
 EVAL_GREEDY = True
 
 time_tag = time.strftime("%Y%m%d-%H%M%S")
-print(f"Start {CURRENT_DISTANCE:.2f} Å → Target {FINAL_TARGET:.2f} Å; Zone [{TARGET_MIN:.2f}, {TARGET_MAX:.2f}] Å")
-print(f"Actions: {ACTION_SIZE} (A×W×Δ); Locks: {ENABLE_MILESTONE_LOCKS}, K={BACKSTOP_K}, margin={LOCK_MARGIN} Å")
-print(f"Zone confinement: {ZONE_CONFINEMENT} (K={ZONE_K}, margins={ZONE_MARGIN_LOW}/{ZONE_MARGIN_HIGH} Å)")
+print(f"Start {CURRENT_DISTANCE:.2f} Å → Target {FINAL_TARGET:.2f} Å; "
+      f"Zone [{TARGET_MIN:.2f}, {TARGET_MAX:.2f}] Å")
+print(f"Actions: {ACTION_SIZE} (A×W×Δ); Locks: {ENABLE_MILESTONE_LOCKS}, "
+      f"K={BACKSTOP_K}, margin={LOCK_MARGIN} Å")
+print(f"Zone confinement: {ZONE_CONFINEMENT} (K={ZONE_K}, "
+      f"margins={ZONE_MARGIN_LOW}/{ZONE_MARGIN_HIGH} Å)")
 
 # --- nonbonded and restraints ---
 nonbondedCutoff = 1.0 * unit.nanometer
 backbone_constraint_strength = 100
+
+# ===================== DCD / trajectory output =======================
+# Per-episode/step DCD trajectories for external monitoring scripts
+DCD_SAVE = True
+RESULTS_TRAJ_DIR = os.path.join(RESULTS_DIR, "dcd_trajs")
+
+# DCD reporter sampling interval (in MD steps) — default: match MFPT sampling
+DCD_REPORT_INTERVAL = dcdfreq_mfpt
+
+# Run naming for compatibility with original monitoring scripts
+RUN_NAME_PREFIX = "ep"   # produces ep0001, ep0002, ...
+RUNS_TXT = os.path.join(RESULTS_TRAJ_DIR, "runs.txt")

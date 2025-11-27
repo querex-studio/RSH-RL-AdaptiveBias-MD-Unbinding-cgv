@@ -1,4 +1,4 @@
-# env_protein.py — Adaptive Gaussian RL with milestone locks + zone confinement (updated)
+import os
 import uuid
 from collections import deque
 import numpy as np
@@ -9,7 +9,21 @@ import openmm.unit as unit
 import openmm.app as omm_app
 from openmm.app import CharmmParameterSet, PDBFile
 
+try:
+    from openmm.app import DCDReporter
+except Exception:
+    try:
+        from simtk.openmm.app import DCDReporter  # type: ignore
+    except Exception:
+        DCDReporter = None
+
 import config
+
+
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+    return path
+
 
 # --------------- Helpers (kept inline for portability) -----------------
 
@@ -49,6 +63,7 @@ def add_backbone_posres(system: openmm.System,
     system.addForce(force)
     return force
 
+
 def propagate_protein(simulation,
                       steps: int,
                       dcdfreq: int,
@@ -76,7 +91,9 @@ def propagate_protein(simulation,
         return float(d_nm * 10.0)
 
     try:
-        openmm.LocalEnergyMinimizer.minimize(ctx, 10.0 * u.kilojoule_per_mole, 200)
+        openmm.LocalEnergyMinimizer.minimize(
+            ctx, 10.0 * u.kilojoule_per_mole, 200
+        )
     except Exception:
         pass
     try:
@@ -96,8 +113,10 @@ def propagate_protein(simulation,
 
     retries_left = int(getattr(config, "MAX_INTEGRATOR_RETRIES", 2))
 
-    # for _ in range(n_chunks):
-    for _ in tqdm(range(n_chunks), desc=f"MD Step {prop_index:>2d}", colour="red", ncols=80):
+    for _ in tqdm(range(n_chunks),
+                  desc=f"MD Step {prop_index:>2d}",
+                  colour="red",
+                  ncols=80):
         try:
             integ.step(dcdfreq)
             if not _positions_finite():
@@ -107,7 +126,16 @@ def propagate_protein(simulation,
                 break
             retries_left -= 1
             try:
-                new_dt = max(float(orig_dt) / 2.0, float(getattr(config, "MIN_STEPSIZE", 0.0005 * u.picoseconds)))
+                new_dt = max(
+                    float(orig_dt) / 2.0,
+                    float(
+                        getattr(
+                            config,
+                            "MIN_STEPSIZE",
+                            0.0005 * u.picoseconds,
+                        )
+                    ),
+                )
                 integ.setStepSize(new_dt)
             except Exception:
                 pass
@@ -118,7 +146,9 @@ def propagate_protein(simulation,
             try:
                 integ.step(dcdfreq)
                 if not _positions_finite():
-                    raise openmm.OpenMMException("NaN positions after recovery")
+                    raise openmm.OpenMMException(
+                        "NaN positions after recovery"
+                    )
             except Exception:
                 break
 
@@ -131,17 +161,16 @@ def propagate_protein(simulation,
     except Exception:
         pass
 
-    return np.array(distances, dtype=np.float32), np.array(times_ps, dtype=np.float32)
+    return np.array(distances, dtype=np.float32), np.array(times_ps,
+                                                           dtype=np.float32)
 
 
 def _phase2_bowl_reward(d):
     err = abs(d - config.TARGET_CENTER)
     if err >= config.TARGET_ZONE_HALF_WIDTH:
         return 0.0
-    scale = 1.0 - (err / config.TARGET_ZONE_HALF_WIDTH)**2
+    scale = 1.0 - (err / config.TARGET_ZONE_HALF_WIDTH) ** 2
     return config.CENTER_GAIN * scale
-
-
 
 
 class ProteinEnvironmentRedesigned:
@@ -189,6 +218,12 @@ class ProteinEnvironmentRedesigned:
         self._last_positions = None      # Quantity array with units (nm)
         self.simulation = None           # expose latest Simulation
 
+        # Episode / DCD bookkeeping
+        self.current_episode_index = None
+        self.current_run_name = None
+        self.current_dcd_index = 0
+        self.current_dcd_paths = []
+
         self.setup_protein_simulation()
         # Discrete action lookup: (amplitude, width, outward_offset)
         self.action_tuples = []
@@ -197,7 +232,9 @@ class ProteinEnvironmentRedesigned:
                 for O in config.OFFSET_BINS:
                     self.action_tuples.append((A, W, O))
         # Safety check
-        assert len(self.action_tuples) == getattr(config, "ACTION_SIZE", len(self.action_tuples))
+        assert len(self.action_tuples) == getattr(
+            config, "ACTION_SIZE", len(self.action_tuples)
+        )
 
     # ---------- System setup ----------
     def setup_protein_simulation(self):
@@ -213,13 +250,17 @@ class ProteinEnvironmentRedesigned:
             constraints=None,
         )
         add_backbone_posres(
-            base_system, self.psf, self.pdb,
+            base_system,
+            self.psf,
+            self.pdb,
             config.backbone_constraint_strength,
-            skip_indices={config.ATOM1_INDEX, config.ATOM2_INDEX}
+            skip_indices={config.ATOM1_INDEX, config.ATOM2_INDEX},
         )
         self.base_system_xml = openmm.XmlSerializer.serialize(base_system)
         print("Protein MD system setup complete.")
-        self.reset()  # default reset
+        self.reset(seed_from_max_A=None,
+                   carry_state=False,
+                   episode_index=None)
 
     # ---------- Persistent locks seeding ----------
     def _seed_persistent_locks(self, max_reached_A: float):
@@ -233,7 +274,10 @@ class ProteinEnvironmentRedesigned:
                 self.locked_milestone_idx += 1
 
     # ---------- Reset ----------
-    def reset(self, seed_from_max_A: float | None = None, carry_state: bool = False):
+    def reset(self,
+              seed_from_max_A: float | None = None,
+              carry_state: bool = False,
+              episode_index: int | None = None):
         # Scalars
         self.current_distance = config.CURRENT_DISTANCE
         self.previous_distance = config.CURRENT_DISTANCE
@@ -275,13 +319,49 @@ class ProteinEnvironmentRedesigned:
         self._last_positions = None
         self.simulation = None
 
+        # Episode / DCD bookkeeping
+        self.current_episode_index = episode_index
+        self.current_dcd_index = 0
+        self.current_dcd_paths = []
+        # keep previous run_name unless new index forces new name
+        if episode_index is None:
+            self.current_run_name = None
+
         # Seed cross-episode locks
         if seed_from_max_A is not None:
             self._seed_persistent_locks(seed_from_max_A)
             if config.SEED_ZONE_CAP_IF_BEST_IN_ZONE:
                 if config.TARGET_MIN <= seed_from_max_A <= config.TARGET_MAX:
-                    self.zone_floor_A  = config.TARGET_MIN + config.ZONE_MARGIN_LOW
-                    self.zone_ceiling_A = config.TARGET_MAX - config.ZONE_MARGIN_HIGH
+                    self.zone_floor_A = (
+                        config.TARGET_MIN + config.ZONE_MARGIN_LOW
+                    )
+                    self.zone_ceiling_A = (
+                        config.TARGET_MAX - config.ZONE_MARGIN_HIGH
+                    )
+
+        # DCD runs.txt bookkeeping (for external monitoring scripts)
+        if getattr(config, "DCD_SAVE", False) and episode_index is not None:
+            dcd_dir = getattr(
+                config,
+                "RESULTS_TRAJ_DIR",
+                os.path.join(config.RESULTS_DIR, "dcd_trajs"),
+            )
+            _ensure_dir(dcd_dir)
+            run_prefix = getattr(config, "RUN_NAME_PREFIX", "ep")
+            run_name = f"{run_prefix}{episode_index:04d}"
+            self.current_run_name = run_name
+            runs_txt = getattr(
+                config,
+                "RUNS_TXT",
+                os.path.join(dcd_dir, "runs.txt"),
+            )
+            existing = set()
+            if os.path.exists(runs_txt):
+                with open(runs_txt, "r") as fh:
+                    existing = {ln.strip() for ln in fh if ln.strip()}
+            if run_name not in existing:
+                with open(runs_txt, "a") as fh:
+                    fh.write(run_name + "\n")
 
         return self.get_state()
 
@@ -289,26 +369,39 @@ class ProteinEnvironmentRedesigned:
     def get_state(self):
         self.distance_history.append(self.current_distance)
         if len(self.distance_history) >= 3:
-            recent_trend = (self.distance_history[-1] - self.distance_history[-3]) / 2.0
+            recent_trend = (
+                self.distance_history[-1] - self.distance_history[-3]
+            ) / 2.0
         else:
             recent_trend = 0.0
         stability = 0.5
         if len(self.distance_history) >= 5:
-            stability = 1.0 / (1.0 + np.std(list(self.distance_history)[-5:]))
+            stability = 1.0 / (
+                1.0 + np.std(list(self.distance_history)[-5:])
+            )
 
-        overall = (self.current_distance - config.CURRENT_DISTANCE) / \
-                  (config.FINAL_TARGET - config.CURRENT_DISTANCE)
+        overall = (self.current_distance - config.CURRENT_DISTANCE) / (
+            config.FINAL_TARGET - config.CURRENT_DISTANCE
+        )
 
-        state = np.array([
-            self.current_distance / config.FINAL_TARGET,
-            max(0.0, overall),
-            abs(self.current_distance - config.TARGET_CENTER) / max(1e-6, config.TARGET_ZONE_HALF_WIDTH),
-            np.clip(overall, 0.0, 1.0),
-            recent_trend / 0.1,
-            float(config.TARGET_MIN <= self.current_distance <= config.TARGET_MAX),  # in-zone flag
-            float(self.no_improve_counter > 0),
-            stability
-        ], dtype=np.float32)
+        state = np.array(
+            [
+                self.current_distance / config.FINAL_TARGET,
+                max(0.0, overall),
+                abs(self.current_distance - config.TARGET_CENTER)
+                / max(1e-6, config.TARGET_ZONE_HALF_WIDTH),
+                np.clip(overall, 0.0, 1.0),
+                recent_trend / 0.1,
+                float(
+                    config.TARGET_MIN
+                    <= self.current_distance
+                    <= config.TARGET_MAX
+                ),  # in-zone flag
+                float(self.no_improve_counter > 0),
+                stability,
+            ],
+            dtype=np.float32,
+        )
         return state
 
     # ---------- Forces ----------
@@ -373,7 +466,8 @@ class ProteinEnvironmentRedesigned:
             if self.zone_floor_A is not None:
                 system = self._add_zone_lower_cap(system, self.zone_floor_A)
             if self.zone_ceiling_A is not None:
-                system = self._add_zone_upper_cap(system, self.zone_ceiling_A)
+                system = self._add_zone_upper_cap(system,
+                                                  self.zone_ceiling_A)
 
         for (_, amp, posA, widthA) in self.all_biases_in_episode:
             system = self._add_gaussian_force(system, amp, posA, widthA)
@@ -382,16 +476,25 @@ class ProteinEnvironmentRedesigned:
 
     # ---------- Policy to choose Gaussian parameters ----------
     def smart_progressive_bias(self, action: int):
-        # If inside target zone, keep small or zero amplitude (agent masking also enforces this)
-        if config.TARGET_MIN <= self.current_distance <= config.TARGET_MAX:
-            return ('gaussian', 0.0, max(self.current_distance - 0.2, config.TARGET_MIN), 0.3)
+        # If inside target zone, keep small or zero amplitude
+        if (
+            config.TARGET_MIN
+            <= self.current_distance
+            <= config.TARGET_MAX
+        ):
+            return (
+                "gaussian",
+                0.0,
+                max(self.current_distance - 0.2, config.TARGET_MIN),
+                0.3,
+            )
 
         A_bins = config.AMP_BINS
         W_bins = config.WIDTH_BINS
         O_bins = config.OFFSET_BINS
         nW, nO = len(W_bins), len(O_bins)
 
-        action = int(max(0, min(action, len(A_bins)*nW*nO - 1)))
+        action = int(max(0, min(action, len(A_bins) * nW * nO - 1)))
         amp_idx = action // (nW * nO)
         rem = action % (nW * nO)
         width_idx = rem // nO
@@ -401,23 +504,31 @@ class ProteinEnvironmentRedesigned:
         base_width = W_bins[width_idx]
         base_offset = O_bins[off_idx]
 
-        progress = (self.current_distance - config.CURRENT_DISTANCE) / \
-                   (config.FINAL_TARGET - config.CURRENT_DISTANCE)
+        progress = (self.current_distance - config.CURRENT_DISTANCE) / (
+            config.FINAL_TARGET - config.CURRENT_DISTANCE
+        )
 
         amplitude = base_amp * (3.0 - 2.0 * np.clip(progress, 0.0, 1.0))
-        width     = base_width * (1.5 - np.clip(progress, 0.0, 1.0))
+        width = base_width * (1.5 - np.clip(progress, 0.0, 1.0))
 
         center = self.current_distance - (base_offset + 0.3)
         center = float(np.clip(center, 0.5, self.current_distance - 0.1))
 
         if self.no_improve_counter >= 2:
-            escalation = min(1.0 + 0.7 * self.no_improve_counter, config.MAX_ESCALATION_FACTOR)
+            escalation = min(
+                1.0 + 0.7 * self.no_improve_counter,
+                config.MAX_ESCALATION_FACTOR,
+            )
             amplitude *= escalation
 
-        amplitude = float(np.clip(amplitude, config.MIN_AMP,  config.MAX_AMP))
-        width     = float(np.clip(width,     config.MIN_WIDTH,config.MAX_WIDTH))
+        amplitude = float(
+            np.clip(amplitude, config.MIN_AMP, config.MAX_AMP)
+        )
+        width = float(
+            np.clip(width, config.MIN_WIDTH, config.MAX_WIDTH)
+        )
 
-        return ('gaussian', amplitude, center, width)
+        return ("gaussian", amplitude, center, width)
 
     # ---------- Step ----------
     def step(self, action_index):
@@ -425,20 +536,28 @@ class ProteinEnvironmentRedesigned:
         action_index = int(action_index)
 
         # map action using your existing helper
-        g_type, amp_kcal, center_A, width_A = self.smart_progressive_bias(action_index)
+        g_type, amp_kcal, center_A, width_A = \
+            self.smart_progressive_bias(action_index)
         amp_kcal = float(min(amp_kcal, 12.0))
         width_A = float(max(width_A, 0.3))
 
         # log bias
         self.step_counter += 1
-        self.all_biases_in_episode.append((g_type, float(amp_kcal), float(center_A), float(width_A)))
-        self.bias_log.append((self.step_counter, float(amp_kcal), float(center_A), float(width_A)))
+        self.all_biases_in_episode.append(
+            (g_type, float(amp_kcal), float(center_A), float(width_A))
+        )
+        self.bias_log.append(
+            (self.step_counter, float(amp_kcal),
+             float(center_A), float(width_A))
+        )
 
         # rebuild system with all active forces
         system = self._system_with_all_forces()
 
         # make Simulation and seed coordinates
-        integrator = openmm.LangevinIntegrator(config.T, config.fricCoef, config.stepsize)
+        integrator = openmm.LangevinIntegrator(
+            config.T, config.fricCoef, config.stepsize
+        )
         sim = omm_app.Simulation(self.psf.topology, system, integrator)
         if self._last_positions is not None:
             sim.context.setPositions(self._last_positions)
@@ -449,22 +568,73 @@ class ProteinEnvironmentRedesigned:
         self._last_simulation = sim
         self._last_topology = self.psf.topology
 
+        # per-step DCD reporter (one DCD file per RL action)
+        if DCDReporter is not None and getattr(config, "DCD_SAVE", False):
+            dcd_dir = getattr(
+                config,
+                "RESULTS_TRAJ_DIR",
+                os.path.join(config.RESULTS_DIR, "dcd_trajs"),
+            )
+            _ensure_dir(dcd_dir)
+            run_prefix = getattr(config, "RUN_NAME_PREFIX", "ep")
+            ep_idx = (
+                self.current_episode_index
+                if getattr(self, "current_episode_index", None)
+                is not None
+                else 0
+            )
+            run_name = getattr(
+                self, "current_run_name", f"{run_prefix}{ep_idx:04d}"
+            )
+            self.current_run_name = run_name
+            self.current_dcd_index = getattr(
+                self, "current_dcd_index", 0
+            ) + 1
+            dcd_name = f"{run_name}_s{self.current_dcd_index:03d}.dcd"
+            dcd_path = os.path.join(dcd_dir, dcd_name)
+            dcd_interval = int(
+                getattr(
+                    config,
+                    "DCD_REPORT_INTERVAL",
+                    config.dcdfreq_mfpt,
+                )
+            )
+            sim.reporters.append(DCDReporter(dcd_path, dcd_interval))
+            # keep list of all DCDs for this episode for possible analysis
+            if (
+                not hasattr(self, "current_dcd_paths")
+                or self.current_dcd_paths is None
+            ):
+                self.current_dcd_paths = []
+            self.current_dcd_paths.append(dcd_path)
+
         # propagate
         dists, _ = propagate_protein(
             simulation=sim,
             steps=config.propagation_step,
             dcdfreq=config.dcdfreq_mfpt,
             prop_index=self.step_counter,
-            atom1_idx=self.atom1_idx if hasattr(self, "atom1_idx") else config.ATOM1_INDEX,
-            atom2_idx=self.atom2_idx if hasattr(self, "atom2_idx") else config.ATOM2_INDEX,
+            atom1_idx=self.atom1_idx
+            if hasattr(self, "atom1_idx")
+            else config.ATOM1_INDEX,
+            atom2_idx=self.atom2_idx
+            if hasattr(self, "atom2_idx")
+            else config.ATOM2_INDEX,
         )
 
         # append segment and bookkeeping
         import numpy as np
-        dists = np.asarray(dists, dtype=np.float32) if dists is not None else np.array([], dtype=np.float32)
+
+        dists = (
+            np.asarray(dists, dtype=np.float32)
+            if dists is not None
+            else np.array([], dtype=np.float32)
+        )
         if dists.size > 0:
             self.episode_trajectory_segments.append(dists.tolist())
-            self._last_positions = sim.context.getState(getPositions=True).getPositions()
+            self._last_positions = (
+                sim.context.getState(getPositions=True).getPositions()
+            )
             last_d = float(dists[-1])
             self.distance_history.extend([float(x) for x in dists])
         else:
@@ -473,47 +643,61 @@ class ProteinEnvironmentRedesigned:
         prev_d = float(self.current_distance)
         self.previous_distance = prev_d
         self.current_distance = last_d
-        self.best_distance_ever = max(self.best_distance_ever, self.current_distance)
+        self.best_distance_ever = max(
+            self.best_distance_ever, self.current_distance
+        )
 
         # reward/phase logic
         delta = self.current_distance - prev_d
-        outward = max(0.0, delta);
+        outward = max(0.0, delta)
         inward = max(0.0, -delta)
-        reward = 0.0;
+        reward = 0.0
         done = False
-        in_zone = (config.TARGET_MIN <= self.current_distance <= config.TARGET_MAX)
+        in_zone = (
+            config.TARGET_MIN <= self.current_distance <= config.TARGET_MAX
+        )
 
         if in_zone and self.phase == 1:
-            self.phase = 2;
+            self.phase = 2
             self.in_zone_count = 0
 
         if self.phase == 1:
             reward += config.PROGRESS_REWARD * outward
             for m in config.DISTANCE_INCREMENTS:
-                if prev_d < m <= self.current_distance and m not in self.milestones_hit:
-                    reward += config.MILESTONE_REWARD;
+                if prev_d < m <= self.current_distance and \
+                        m not in self.milestones_hit:
+                    reward += config.MILESTONE_REWARD
                     self.milestones_hit.add(m)
-            if outward > 0.0: reward += config.VELOCITY_BONUS
+            if outward > 0.0:
+                reward += config.VELOCITY_BONUS
             reward += config.STEP_PENALTY
-            if inward > 0.02: reward += config.BACKTRACK_PENALTY
+            if inward > 0.02:
+                reward += config.BACKTRACK_PENALTY
             if in_zone:
-                self.phase = 2;
-                self.in_zone_count = 1;
+                self.phase = 2
+                self.in_zone_count = 1
                 reward += config.CONSISTENCY_BONUS
         else:
             reward += _phase2_bowl_reward(self.current_distance)
             if not in_zone:
-                self.phase = 1;
+                self.phase = 1
                 self.in_zone_count = 0
-                reward -= 2 * abs(self.current_distance - config.TARGET_CENTER)
+                reward -= 2 * abs(
+                    self.current_distance - config.TARGET_CENTER
+                )
             else:
-                self.in_zone_count = getattr(self, "in_zone_count", 0) + 1
+                self.in_zone_count = getattr(
+                    self, "in_zone_count", 0
+                ) + 1
                 reward += 0.5 * config.CONSISTENCY_BONUS
                 if self.in_zone_count >= config.STABILITY_STEPS:
-                    reward += 1000.0;
+                    reward += 1000.0
                     done = True
-                if abs(self.current_distance - config.TARGET_CENTER) < config.PHASE2_TOL:
-                    reward += 1500.0;
+                if (
+                    abs(self.current_distance - config.TARGET_CENTER)
+                    < config.PHASE2_TOL
+                ):
+                    reward += 1500.0
                     done = True
             reward += config.STEP_PENALTY
 
