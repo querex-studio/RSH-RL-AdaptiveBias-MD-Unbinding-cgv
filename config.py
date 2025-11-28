@@ -92,7 +92,7 @@ fricCoef = 2.0 / unit.picoseconds
 # --- thermostat temperature ---
 T = 300 * unit.kelvin
 
-propagation_step = 3000                    # total integrator steps per action
+propagation_step = 5000                    # total integrator steps per action
 dcdfreq_mfpt = 40                          # save interval
 
 # NaN recovery

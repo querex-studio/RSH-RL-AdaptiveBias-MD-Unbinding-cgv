@@ -77,13 +77,6 @@ def plot_coverage_histogram(dist_segments, episode_num: int, bin_size=0.25):
 def plot_distance_trajectory(episode_trajectories,
                              episode_num: int,
                              distance_history=None):
-    """
-    Plot full P–Mg distance versus TOTAL SIMULATION TIME (ns)
-    instead of raw frame index.
-
-    Time per saved frame:
-        dt_frame_ps = config.dcdfreq_mfpt * config.stepsize (in ps)
-    """
     plot_dir = _ensure(f"{config.RESULTS_DIR}/full_trajectories/")
     # fallback
     if ((not episode_trajectories or len(episode_trajectories) == 0)
@@ -103,25 +96,17 @@ def plot_distance_trajectory(episode_trajectories,
     if full_traj.ndim == 0:
         full_traj = full_traj.reshape(1)
 
-    # Time axis in ns:
-    #   dt_frame_ps = dcdfreq_mfpt * stepsize(ps)
-    #   t_ns = frame_index * dt_frame_ps / 1000
-    dt_frame_ps = (
-        config.dcdfreq_mfpt *
-        float(config.stepsize.value_in_unit(omm_unit.picoseconds))
-    )
-    frame_idx = np.arange(len(full_traj), dtype=np.float32)
-    time_axis_ns = frame_idx * (dt_frame_ps / 1000.0)
+    # simple x-axis in pseudo-time units (frames)
+    time_axis = np.arange(len(full_traj), dtype=np.float32)
 
     # plot
     plt.figure(figsize=(9, 4.5))
-    plt.plot(time_axis_ns, full_traj, linewidth=1.8)
+    plt.plot(time_axis, full_traj, linewidth=1.8)
     plt.axhspan(config.TARGET_MIN, config.TARGET_MAX,
                 color='green', alpha=0.15, label='Target zone')
     plt.axhline(config.TARGET_CENTER,
-                linestyle='--', linewidth=1.0,
-                label=f'Target {config.TARGET_CENTER:.1f} Å')
-    plt.xlabel("Time (ns)")
+                linestyle='--', linewidth=1.0, label='Target 8.5 Å')
+    plt.xlabel("Frames")
     plt.ylabel("P–Mg distance (Å)")
     plt.title(f"Episode {episode_num:04d} trajectory")
     plt.legend()
@@ -132,12 +117,12 @@ def plot_distance_trajectory(episode_trajectories,
     plt.close()
     print(f"Saved trajectory plot: {out_png}")
 
-    # CSV export with time in ns
+    # CSV export
     out_csv = os.path.join(plot_dir,
                            f"progressive_traj_ep_{episode_num:04d}.csv")
-    np.savetxt(out_csv, np.c_[time_axis_ns, full_traj],
+    np.savetxt(out_csv, np.c_[time_axis, full_traj],
                delimiter=",",
-               header="time_ns,distance_A", comments="")
+               header="frame,distance_A", comments="")
     print(f"Saved trajectory CSV: {out_csv}")
 
 

@@ -1,13 +1,15 @@
+# env_protein.py ===============================================================
 import os
 import uuid
 from collections import deque
+
 import numpy as np
 from tqdm import tqdm
 
 import openmm
 import openmm.unit as unit
 import openmm.app as omm_app
-from openmm.app import CharmmParameterSet, PDBFile
+from openmm.app import CharmmPsfFile, PDBFile
 
 try:
     from openmm.app import DCDReporter
@@ -20,21 +22,32 @@ except Exception:
 import config
 
 
+# ------------------------- small helpers --------------------------------------
+
+
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
     return path
 
 
-# --------------- Helpers (kept inline for portability) -----------------
-
 def read_params(filename: str):
     par_files = []
-    with open(filename, 'r') as f:
+    with open(filename, "r") as f:
         for line in f:
-            line = line.split('!')[0].strip()
+            line = line.split("!")[0].strip()
             if line:
                 par_files.append(line)
-    return CharmmParameterSet(*tuple(par_files))
+    return CharmmPsfFile, par_files  # not used directly here; kept for parity
+
+
+def load_charmm_params(filename: str):
+    par_files = []
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.split("!")[0].strip()
+            if line:
+                par_files.append(line)
+    return omm_app.CharmmParameterSet(*tuple(par_files))
 
 
 def add_backbone_posres(system: openmm.System,
@@ -47,7 +60,7 @@ def add_backbone_posres(system: openmm.System,
     else:
         skip_indices = set(skip_indices)
 
-    force = openmm.CustomExternalForce("k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+    force = openmm.CustomExternalForce("k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
     force.addGlobalParameter("k", strength)
     force.addPerParticleParameter("x0")
     force.addPerParticleParameter("y0")
@@ -56,7 +69,7 @@ def add_backbone_posres(system: openmm.System,
     for i, pos in enumerate(pdb.positions):
         if i in skip_indices:
             continue
-        if psf.atom_list[i].name in ('N', 'CA', 'C'):
+        if psf.atom_list[i].name in ("N", "CA", "C"):
             xyz = pos.value_in_unit(unit.nanometer)
             force.addParticle(i, xyz)
 
@@ -70,9 +83,12 @@ def propagate_protein(simulation,
                       prop_index: int,
                       atom1_idx: int,
                       atom2_idx: int):
-    import numpy as np
+    """
+    Run MD propagation with NaN checks and simple adaptive time-stepping.
+
+    Crucially, we now use simulation.step(dcdfreq) so DCDReporter gets frames.
+    """
     from openmm import unit as u
-    import openmm
 
     ctx = simulation.context
     integ = simulation.integrator
@@ -90,6 +106,7 @@ def propagate_protein(simulation,
         d_nm = np.linalg.norm(p2 - p1)
         return float(d_nm * 10.0)
 
+    # local minimization + velocity reinit
     try:
         openmm.LocalEnergyMinimizer.minimize(
             ctx, 10.0 * u.kilojoule_per_mole, 200
@@ -113,18 +130,22 @@ def propagate_protein(simulation,
 
     retries_left = int(getattr(config, "MAX_INTEGRATOR_RETRIES", 2))
 
-    for _ in tqdm(range(n_chunks),
-                  desc=f"MD Step {prop_index:>2d}",
-                  colour="red",
-                  ncols=80):
+    for _ in tqdm(
+        range(n_chunks),
+        desc=f"MD Step {prop_index:>2d}",
+        colour="red",
+        ncols=80,
+    ):
         try:
-            integ.step(dcdfreq)
+            # IMPORTANT: use simulation.step so reporters fire
+            simulation.step(dcdfreq)
             if not _positions_finite():
                 raise openmm.OpenMMException("NaN positions detected")
         except Exception:
             if retries_left <= 0:
                 break
             retries_left -= 1
+            # reduce dt
             try:
                 new_dt = max(
                     float(orig_dt) / 2.0,
@@ -139,12 +160,14 @@ def propagate_protein(simulation,
                 integ.setStepSize(new_dt)
             except Exception:
                 pass
+            # reinit velocities
             try:
                 ctx.setVelocitiesToTemperature(config.T)
             except Exception:
                 pass
+            # retry this chunk
             try:
-                integ.step(dcdfreq)
+                simulation.step(dcdfreq)
                 if not _positions_finite():
                     raise openmm.OpenMMException(
                         "NaN positions after recovery"
@@ -153,16 +176,20 @@ def propagate_protein(simulation,
                 break
 
         distances.append(_current_distance_A())
-        t_ps += float(dcdfreq) * float(orig_dt.value_in_unit(u.picoseconds))
+        t_ps += float(dcdfreq) * float(
+            orig_dt.value_in_unit(u.picoseconds)
+        )
         times_ps.append(t_ps)
 
+    # restore step size
     try:
         integ.setStepSize(orig_dt)
     except Exception:
         pass
 
-    return np.array(distances, dtype=np.float32), np.array(times_ps,
-                                                           dtype=np.float32)
+    return np.array(distances, dtype=np.float32), np.array(
+        times_ps, dtype=np.float32
+    )
 
 
 def _phase2_bowl_reward(d):
@@ -173,8 +200,21 @@ def _phase2_bowl_reward(d):
     return config.CENTER_GAIN * scale
 
 
+# ---------------------- main environment class --------------------------------
+
+
 class ProteinEnvironmentRedesigned:
+    """
+    RL environment with:
+      - Gaussian bias actions
+      - Milestone / zone logic
+      - Per-step DCD trajectories (one DCD per RL action):
+            results_PPO/dcd_trajs/ep0001_s001.dcd, ep0001_s002.dcd, ...
+      - runs.txt updated for compatibility with Balint's scripts
+    """
+
     def __init__(self):
+        # episode / milestone bookkeeping
         self.milestones_hit = set()
         self.in_zone_count = 0
 
@@ -211,12 +251,12 @@ class ProteinEnvironmentRedesigned:
         self.current_positions = None
         self.current_velocities = None
 
-        # ---- Caches for end-of-episode PDB writing ----
-        self._last_simulation = None     # OpenMM Simulation
-        self._last_context = None        # OpenMM Context
-        self._last_topology = None       # OpenMM Topology
-        self._last_positions = None      # Quantity array with units (nm)
-        self.simulation = None           # expose latest Simulation
+        # caches for last MD state
+        self._last_simulation = None
+        self._last_context = None
+        self._last_topology = None
+        self._last_positions = None
+        self.simulation = None
 
         # Episode / DCD bookkeeping
         self.current_episode_index = None
@@ -224,24 +264,28 @@ class ProteinEnvironmentRedesigned:
         self.current_dcd_index = 0
         self.current_dcd_paths = []
 
+        # atom indices
+        self.atom1_idx = config.ATOM1_INDEX
+        self.atom2_idx = config.ATOM2_INDEX
+
+        # set up base system
         self.setup_protein_simulation()
+
         # Discrete action lookup: (amplitude, width, outward_offset)
         self.action_tuples = []
         for A in config.AMP_BINS:
             for W in config.WIDTH_BINS:
                 for O in config.OFFSET_BINS:
                     self.action_tuples.append((A, W, O))
-        # Safety check
-        assert len(self.action_tuples) == getattr(
-            config, "ACTION_SIZE", len(self.action_tuples)
-        )
+        assert len(self.action_tuples) == config.ACTION_SIZE
 
     # ---------- System setup ----------
+
     def setup_protein_simulation(self):
         print("Setting up protein MD system...")
         self.psf = omm_app.CharmmPsfFile(config.psf_file)
         self.pdb = omm_app.PDBFile(config.pdb_file)
-        self.params = read_params(config.toppar_file)
+        self.params = load_charmm_params(config.toppar_file)
 
         base_system = self.psf.createSystem(
             self.params,
@@ -254,16 +298,18 @@ class ProteinEnvironmentRedesigned:
             self.psf,
             self.pdb,
             config.backbone_constraint_strength,
-            skip_indices={config.ATOM1_INDEX, config.ATOM2_INDEX},
+            skip_indices={self.atom1_idx, self.atom2_idx},
         )
         self.base_system_xml = openmm.XmlSerializer.serialize(base_system)
         print("Protein MD system setup complete.")
-        self.reset(seed_from_max_A=None,
-                   carry_state=False,
+
+        # initial reset
+        self.reset(seed_from_max_A=None, carry_state=False,
                    episode_index=None)
 
     # ---------- Persistent locks seeding ----------
-    def _seed_persistent_locks(self, max_reached_A: float):
+
+    def _seed_persistent_locks(self, max_reached_A):
         if not config.ENABLE_MILESTONE_LOCKS or max_reached_A is None:
             return
         self.backstops_A = []
@@ -274,16 +320,17 @@ class ProteinEnvironmentRedesigned:
                 self.locked_milestone_idx += 1
 
     # ---------- Reset ----------
+
     def reset(self,
-              seed_from_max_A: float | None = None,
-              carry_state: bool = False,
-              episode_index: int | None = None):
+              seed_from_max_A=None,
+              carry_state=False,
+              episode_index=None):
         # Scalars
         self.current_distance = config.CURRENT_DISTANCE
         self.previous_distance = config.CURRENT_DISTANCE
-        self.distance_history = [float(self.current_distance)]
         self.best_distance_ever = float(self.current_distance)
         self.distance_history.clear()
+        self.distance_history.append(float(self.current_distance))
 
         # Logs
         self.all_biases_in_episode = []
@@ -308,11 +355,11 @@ class ProteinEnvironmentRedesigned:
             self.current_positions = None
             self.current_velocities = None
 
-        # Zone walls cleared (and optionally seeded below)
+        # Zone walls cleared
         self.zone_floor_A = None
         self.zone_ceiling_A = None
 
-        # Clear caches for PDB writer at new episode start
+        # caches cleared
         self._last_simulation = None
         self._last_context = None
         self._last_topology = None
@@ -323,11 +370,10 @@ class ProteinEnvironmentRedesigned:
         self.current_episode_index = episode_index
         self.current_dcd_index = 0
         self.current_dcd_paths = []
-        # keep previous run_name unless new index forces new name
         if episode_index is None:
             self.current_run_name = None
 
-        # Seed cross-episode locks
+        # seed cross-episode locks
         if seed_from_max_A is not None:
             self._seed_persistent_locks(seed_from_max_A)
             if config.SEED_ZONE_CAP_IF_BEST_IN_ZONE:
@@ -339,7 +385,7 @@ class ProteinEnvironmentRedesigned:
                         config.TARGET_MAX - config.ZONE_MARGIN_HIGH
                     )
 
-        # DCD runs.txt bookkeeping (for external monitoring scripts)
+        # runs.txt bookkeeping
         if getattr(config, "DCD_SAVE", False) and episode_index is not None:
             dcd_dir = getattr(
                 config,
@@ -366,6 +412,7 @@ class ProteinEnvironmentRedesigned:
         return self.get_state()
 
     # ---------- State ----------
+
     def get_state(self):
         self.distance_history.append(self.current_distance)
         if len(self.distance_history) >= 3:
@@ -396,7 +443,7 @@ class ProteinEnvironmentRedesigned:
                     config.TARGET_MIN
                     <= self.current_distance
                     <= config.TARGET_MAX
-                ),  # in-zone flag
+                ),
                 float(self.no_improve_counter > 0),
                 stability,
             ],
@@ -405,17 +452,18 @@ class ProteinEnvironmentRedesigned:
         return state
 
     # ---------- Forces ----------
+
     def _add_gaussian_force(self, system, amplitude_kcal, center_A, width_A):
         uid = str(uuid.uuid4())[:8]
-        A = f"A_{uid}"
-        mu = f"mu_{uid}"
-        sigma = f"sigma_{uid}"
-        expr = f"{A}*exp(-((r-{mu})^2)/(2*{sigma}^2))"
+        A_name = f"A_{uid}"
+        mu_name = f"mu_{uid}"
+        sig_name = f"sigma_{uid}"
+        expr = f"{A_name}*exp(-((r-{mu_name})^2)/(2*{sig_name}^2))"
         cf = openmm.CustomBondForce(expr)
-        cf.addGlobalParameter(A, amplitude_kcal * 4.184)  # kcal -> kJ
-        cf.addGlobalParameter(mu, center_A / 10.0)        # Å -> nm
-        cf.addGlobalParameter(sigma, max(1e-6, width_A / 10.0))
-        cf.addBond(config.ATOM1_INDEX, config.ATOM2_INDEX)
+        cf.addGlobalParameter(A_name, amplitude_kcal * 4.184)  # kcal→kJ
+        cf.addGlobalParameter(mu_name, center_A / 10.0)        # Å→nm
+        cf.addGlobalParameter(sig_name, max(1e-6, width_A / 10.0))
+        cf.addBond(self.atom1_idx, self.atom2_idx)
         system.addForce(cf)
         return system
 
@@ -427,11 +475,11 @@ class ProteinEnvironmentRedesigned:
         cf = openmm.CustomBondForce(expr)
         cf.addGlobalParameter(kname, float(config.BACKSTOP_K))
         cf.addGlobalParameter(mname, m_eff_A / 10.0)
-        cf.addBond(config.ATOM1_INDEX, config.ATOM2_INDEX)
+        cf.addBond(self.atom1_idx, self.atom2_idx)
         system.addForce(cf)
         return system
 
-    def _add_zone_upper_cap(self, system, u_eff_A: float):
+    def _add_zone_upper_cap(self, system, u_eff_A):
         uid = str(uuid.uuid4())[:8]
         kname = f"k_cap_{uid}"
         uname = f"u_{uid}"
@@ -439,11 +487,11 @@ class ProteinEnvironmentRedesigned:
         cf = openmm.CustomBondForce(expr)
         cf.addGlobalParameter(kname, float(config.ZONE_K))
         cf.addGlobalParameter(uname, u_eff_A / 10.0)
-        cf.addBond(config.ATOM1_INDEX, config.ATOM2_INDEX)
+        cf.addBond(self.atom1_idx, self.atom2_idx)
         system.addForce(cf)
         return system
 
-    def _add_zone_lower_cap(self, system, l_eff_A: float):
+    def _add_zone_lower_cap(self, system, l_eff_A):
         uid = str(uuid.uuid4())[:8]
         kname = f"k_floor_{uid}"
         lname = f"l_{uid}"
@@ -451,32 +499,35 @@ class ProteinEnvironmentRedesigned:
         cf = openmm.CustomBondForce(expr)
         cf.addGlobalParameter(kname, float(config.ZONE_K))
         cf.addGlobalParameter(lname, l_eff_A / 10.0)
-        cf.addBond(config.ATOM1_INDEX, config.ATOM2_INDEX)
+        cf.addBond(self.atom1_idx, self.atom2_idx)
         system.addForce(cf)
         return system
 
     def _system_with_all_forces(self):
         system = openmm.XmlSerializer.deserialize(self.base_system_xml)
 
+        # backstop locks
         if config.ENABLE_MILESTONE_LOCKS:
             for m_eff_A in self.backstops_A:
                 system = self._add_backstop_force(system, m_eff_A)
 
+        # zone caps
         if config.ZONE_CONFINEMENT:
             if self.zone_floor_A is not None:
                 system = self._add_zone_lower_cap(system, self.zone_floor_A)
             if self.zone_ceiling_A is not None:
-                system = self._add_zone_upper_cap(system,
-                                                  self.zone_ceiling_A)
+                system = self._add_zone_upper_cap(system, self.zone_ceiling_A)
 
+        # gaussian biases
         for (_, amp, posA, widthA) in self.all_biases_in_episode:
             system = self._add_gaussian_force(system, amp, posA, widthA)
 
         return system
 
-    # ---------- Policy to choose Gaussian parameters ----------
+    # ---------- action → Gaussian parameters ----------
+
     def smart_progressive_bias(self, action: int):
-        # If inside target zone, keep small or zero amplitude
+        # inside target zone: minimal perturbation
         if (
             config.TARGET_MIN
             <= self.current_distance
@@ -531,11 +582,12 @@ class ProteinEnvironmentRedesigned:
         return ("gaussian", amplitude, center, width)
 
     # ---------- Step ----------
+
     def step(self, action_index):
         # sanitize
         action_index = int(action_index)
 
-        # map action using your existing helper
+        # pick Gaussian according to RL action
         g_type, amp_kcal, center_A, width_A = \
             self.smart_progressive_bias(action_index)
         amp_kcal = float(min(amp_kcal, 12.0))
@@ -551,10 +603,10 @@ class ProteinEnvironmentRedesigned:
              float(center_A), float(width_A))
         )
 
-        # rebuild system with all active forces
+        # rebuild system with all forces
         system = self._system_with_all_forces()
 
-        # make Simulation and seed coordinates
+        # new Simulation for this step (mode A: per-step DCD)
         integrator = openmm.LangevinIntegrator(
             config.T, config.fricCoef, config.stepsize
         )
@@ -568,7 +620,7 @@ class ProteinEnvironmentRedesigned:
         self._last_simulation = sim
         self._last_topology = self.psf.topology
 
-        # per-step DCD reporter (one DCD file per RL action)
+        # Attach DCD reporter for this step
         if DCDReporter is not None and getattr(config, "DCD_SAVE", False):
             dcd_dir = getattr(
                 config,
@@ -576,55 +628,42 @@ class ProteinEnvironmentRedesigned:
                 os.path.join(config.RESULTS_DIR, "dcd_trajs"),
             )
             _ensure_dir(dcd_dir)
-            run_prefix = getattr(config, "RUN_NAME_PREFIX", "ep")
-            ep_idx = (
-                self.current_episode_index
-                if getattr(self, "current_episode_index", None)
-                is not None
-                else 0
+            # run name
+            if self.current_run_name is None:
+                run_prefix = getattr(config, "RUN_NAME_PREFIX", "ep")
+                ep_idx = (
+                    self.current_episode_index
+                    if self.current_episode_index is not None
+                    else 0
+                )
+                self.current_run_name = f"{run_prefix}{ep_idx:04d}"
+            self.current_dcd_index += 1
+            dcd_name = (
+                f"{self.current_run_name}_s{self.current_dcd_index:03d}.dcd"
             )
-            run_name = getattr(
-                self, "current_run_name", f"{run_prefix}{ep_idx:04d}"
-            )
-            self.current_run_name = run_name
-            self.current_dcd_index = getattr(
-                self, "current_dcd_index", 0
-            ) + 1
-            dcd_name = f"{run_name}_s{self.current_dcd_index:03d}.dcd"
             dcd_path = os.path.join(dcd_dir, dcd_name)
-            dcd_interval = int(
+            interval = int(
                 getattr(
                     config,
                     "DCD_REPORT_INTERVAL",
                     config.dcdfreq_mfpt,
                 )
             )
-            sim.reporters.append(DCDReporter(dcd_path, dcd_interval))
-            # keep list of all DCDs for this episode for possible analysis
-            if (
-                not hasattr(self, "current_dcd_paths")
-                or self.current_dcd_paths is None
-            ):
-                self.current_dcd_paths = []
+            sim.reporters.append(DCDReporter(dcd_path, interval))
+            # track
             self.current_dcd_paths.append(dcd_path)
 
-        # propagate
+        # propagate MD
         dists, _ = propagate_protein(
             simulation=sim,
             steps=config.propagation_step,
             dcdfreq=config.dcdfreq_mfpt,
             prop_index=self.step_counter,
-            atom1_idx=self.atom1_idx
-            if hasattr(self, "atom1_idx")
-            else config.ATOM1_INDEX,
-            atom2_idx=self.atom2_idx
-            if hasattr(self, "atom2_idx")
-            else config.ATOM2_INDEX,
+            atom1_idx=self.atom1_idx,
+            atom2_idx=self.atom2_idx,
         )
 
-        # append segment and bookkeeping
-        import numpy as np
-
+        # segment bookkeeping
         dists = (
             np.asarray(dists, dtype=np.float32)
             if dists is not None
@@ -647,7 +686,7 @@ class ProteinEnvironmentRedesigned:
             self.best_distance_ever, self.current_distance
         )
 
-        # reward/phase logic
+        # reward / termination
         delta = self.current_distance - prev_d
         outward = max(0.0, delta)
         inward = max(0.0, -delta)
