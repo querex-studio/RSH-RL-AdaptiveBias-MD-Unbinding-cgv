@@ -4,10 +4,10 @@ import os, os.path
 import MDAnalysis
 from MDAnalysis.analysis import distances
 
-psf_file = '/mnt/data1/users/tj/WORK/RL_MFPT/1D_PMg/trajectory/explore_traj/step3_input.psf'
-dcd_dir = '/mnt/data1/users/tj/WORK/RL_MFPT/1D_PMg/trajectory/explore_traj/'
+psf_file = '../step3_input.psf'
+dcd_dir = '../results_PPO/dcd_trajs/'
 
-with open('runs.txt', 'r') as file:
+with open('../results_PPO/dcd_trajs/runs.txt', 'r') as file:
     for line in file:
       run_name = line.strip()
       print(run_name)
