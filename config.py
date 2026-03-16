@@ -4,6 +4,7 @@ import openmm
 from openmm import unit
 
 SEED = 42
+ROOT_DIR = os.path.dirname(__file__)
 
 
 def get_best_platform():
@@ -28,14 +29,29 @@ pdb_file = 'traj_0.restart.pdb'
 toppar_file = 'toppar.str'
 
 # ---- Atoms
-ATOM1_INDEX = 7799
-ATOM2_INDEX = 7840
+ATOM1_INDEX = 7799   # Phosphate (CV1)
+ATOM2_INDEX = 7840   # Magnesium (CV1)
+CV1_LABEL = "CV1 (Phosphate-Mg distance)"
+
+# CV2: Glutamine-Asparagine (Gln43-Asn26)
+# User can easily change these indices here
+ATOM3_INDEX = 660    # Gln43 CA
+ATOM4_INDEX = 381    # Asn26 CA
+CV2_LABEL = "CV2 (Gln43 CA - Asn26 CA distance)"
+
 # Optional multi-pair training: list of tuples; leave empty to disable
 ATOM_PAIRS = []
 
 # ---- Targets
+# CV1 (Phosphate-Magnesium): Short -> Long
+# Start ~3.3A, Target ~7.5A
 CURRENT_DISTANCE = 3.3
 FINAL_TARGET = 7.5
+
+# CV2 (Gln-Asn): Long -> Short
+# Start ~13.5A, Target ~4.5A (Contact)
+CURRENT_DISTANCE_2 = 13.5
+FINAL_TARGET_2 = 4.5 
 TARGET_CENTER = FINAL_TARGET
 TARGET_ZONE_HALF_WIDTH = 0.35
 TARGET_MIN = TARGET_CENTER - TARGET_ZONE_HALF_WIDTH
@@ -86,7 +102,7 @@ LR = 1e-4
 PPO_TARGET_KL = 0.03
 
 # ===================== Episode & MD =======================
-MAX_ACTIONS_PER_EPISODE = 16
+MAX_ACTIONS_PER_EPISODE = 32
 stepsize = 0.001 * unit.picoseconds      # safer integrator
 fricCoef = 2.0 / unit.picoseconds
 # --- thermostat temperature ---
@@ -117,9 +133,9 @@ PROB_FRESH_START = 0.5
 EVAL_EVERY = 5
 N_EVAL_EPISODES = 3
 SAVE_CHECKPOINT_EVERY = 5
-RESULTS_DIR = "results_PPO"
-PLOTS_DIR = "plots"
-METRICS_CSV = f"{RESULTS_DIR}/training_metrics.csv"
+RESULTS_DIR = os.path.join(ROOT_DIR, "results_PPO")
+PLOTS_DIR = os.path.join(RESULTS_DIR, "plots")
+METRICS_CSV = os.path.join(RESULTS_DIR, "training_metrics.csv")
 
 EVAL_GREEDY = True
 
@@ -146,3 +162,8 @@ DCD_REPORT_INTERVAL = dcdfreq_mfpt
 # Run naming for compatibility with original monitoring scripts
 RUN_NAME_PREFIX = "ep"   # produces ep0001, ep0002, ...
 RUNS_TXT = os.path.join(RESULTS_TRAJ_DIR, "runs.txt")
+
+# Analysis runs (PCA/post-process)
+RUNS_DIR = os.path.join(RESULTS_DIR, "analysis_runs")
+EPISODE_PDB_DIR = os.path.join(RESULTS_DIR, "episode_pdbs")
+BIAS_PROFILE_DIR = os.path.join(RESULTS_DIR, "bias_profiles")
