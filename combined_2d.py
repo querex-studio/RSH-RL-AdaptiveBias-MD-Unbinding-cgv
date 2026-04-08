@@ -13,8 +13,8 @@ Key change vs 1D:
 - Environment tracks two distances:
     CV1: distance(atom1, atom2)   (main progress CV)
     CV2: distance(atom3, atom4)   (auxiliary CV)
-- Action maps to a single 2D Gaussian bias in (CV1, CV2).
-- Bias is applied as the *sum of 2D Gaussians* accumulated across steps.
+- Bias can be applied either as a 1D Gaussian on CV1 or as a 2D Gaussian
+  in (CV1, CV2), selected through `BIAS_MODE`.
 
 This keeps method signatures, agent logic, and main-loop usage unchanged.
 """
@@ -88,12 +88,14 @@ toppar_file = "toppar.str"
 # CV1 (primary progress CV)
 ATOM1_INDEX = 7799
 ATOM2_INDEX = 7840
-CV1_LABEL = f"CV1 (atom {ATOM1_INDEX} - atom {ATOM2_INDEX} distance)"
+CV1_LABEL = f"CV1 Mg-P distance (atom {ATOM1_INDEX}-{ATOM2_INDEX})"
 
-# CV2 (auxiliary CV)  <-- YOU MUST SET THESE
-ATOM3_INDEX = 487
-ATOM4_INDEX = 3789
-CV2_LABEL = f"CV2 (atom {ATOM3_INDEX} - atom {ATOM4_INDEX} distance)"
+# CV2 (auxiliary CV)
+ATOM3_INDEX = 7799
+ATOM4_INDEX = 7842
+CV2_LABEL = f"CV2 Mg-O2 phosphate distance (atoms {ATOM3_INDEX}-{ATOM4_INDEX})"
+CV1_AXIS_LABEL = f"{CV1_LABEL} (A)"
+CV2_AXIS_LABEL = f"{CV2_LABEL} (A)"
 
 # Optional: override CV pairs via list (first two are used)
 # e.g. ATOM_PAIRS = [(7799,7840), (123,456)]
@@ -111,12 +113,13 @@ TARGET_MAX = TARGET_CENTER + TARGET_ZONE_HALF_WIDTH
 # If you do not know a good CV2 target yet:
 #   - leave CURRENT_DISTANCE2 = None to auto-detect from the starting structure
 #   - set TARGET2_ZONE_HALF_WIDTH to a reasonable corridor width (Å)
-CURRENT_DISTANCE2 = 8.5
-FINAL_TARGET2 = 4.0            # optional; if None, uses CURRENT_DISTANCE2
+CURRENT_DISTANCE2 = 1.861
+FINAL_TARGET2 = 6.507          # optional; if None, uses CURRENT_DISTANCE2
 TARGET2_CENTER = FINAL_TARGET2           # optional; if None, uses FINAL_TARGET2 or CURRENT_DISTANCE2
 TARGET2_ZONE_HALF_WIDTH = 0.35
 TARGET2_MIN = TARGET2_CENTER - TARGET2_ZONE_HALF_WIDTH
 TARGET2_MAX = TARGET2_CENTER + TARGET2_ZONE_HALF_WIDTH
+CV2_PROGRESS_DIRECTION = "increase"  # "decrease" for closing contacts, "increase" for unbinding-like distances
 
 # ---- Milestones ----
 DISTANCE_INCREMENTS = [3.5, 3.8, 4.2, 4.6, 5.0, 5.4, 5.8, 6.2, 6.6, 7.0, 7.3]
@@ -155,6 +158,7 @@ SEED_ZONE_CAP_IF_BEST_IN_ZONE = True
 # ---- Observation/action ----
 # 2D state adds 2 features (cv2 normalized + cv2 trend), so default is 10.
 STATE_SIZE = 11
+BIAS_MODE = "1d"  # one of: "1d", "2d"
 
 AMP_BINS = [0.0, 4.0, 8.0, 12.0, 16.0]
 # 2D Gaussian center offsets (A): PPO selects dx, dy relative to current CVs
@@ -162,7 +166,6 @@ DX_BINS = [-1.0, -0.5, 0.0, 0.5, 1.0]
 DY_BINS = [-1.0, -0.5, 0.0, 0.5, 1.0]
 # Shared width (A) for the 2D Gaussian
 SIGMA_BINS = [0.35, 0.6, 0.9]
-ACTION_SIZE = len(AMP_BINS) * len(DX_BINS) * len(DY_BINS) * len(SIGMA_BINS)
 ACTION_MODE = "discrete"  # future: add continuous mode
 
 MIN_AMP, MAX_AMP = 0.0, 32.0
@@ -188,7 +191,6 @@ PPO_TARGET_KL = 0.03
 # ---- Episode & MD ----
 MAX_ACTIONS_PER_EPISODE = 10
 MAX_GAUSSIANS_PER_ACTION = 3
-MAX_BIAS_TERMS_PER_EPISODE = MAX_ACTIONS_PER_EPISODE * MAX_GAUSSIANS_PER_ACTION
 RIBBON_CV1_NEAR_OFFSET_A = 0.22
 RIBBON_CV1_NEAR_OFFSET_SCALE = 0.18
 RIBBON_CV1_SPAN_A = 0.55
@@ -282,6 +284,27 @@ AUTO_REWEIGHTED_FES_BINS = 120
 AUTO_REWEIGHTED_FES_TEMPERATURE = 300.0
 
 
+def _normalized_bias_mode(mode=None) -> str:
+    value = str(BIAS_MODE if mode is None else mode).strip().lower()
+    if value not in {"1d", "2d"}:
+        raise ValueError(f"Unsupported BIAS_MODE={value!r}. Use '1d' or '2d'.")
+    return value
+
+
+def bias_terms_per_action(mode=None) -> int:
+    return 1 if _normalized_bias_mode(mode) == "1d" else int(MAX_GAUSSIANS_PER_ACTION)
+
+
+def action_size_for_mode(mode=None) -> int:
+    if _normalized_bias_mode(mode) == "1d":
+        return len(AMP_BINS) * len(DX_BINS) * len(SIGMA_BINS)
+    return len(AMP_BINS) * len(DX_BINS) * len(DY_BINS) * len(SIGMA_BINS)
+
+
+ACTION_SIZE = action_size_for_mode()
+MAX_BIAS_TERMS_PER_EPISODE = MAX_ACTIONS_PER_EPISODE * bias_terms_per_action()
+
+
 def curriculum_cv1_targets():
     vals = [float(x) for x in DISTANCE_INCREMENTS]
     if not vals or abs(vals[-1] - float(FINAL_TARGET)) > 1e-6:
@@ -297,6 +320,20 @@ def curriculum_half_width_for_target(target_center_A: float) -> float:
     gap = max(0.0, float(target_center_A) - float(CURRENT_DISTANCE))
     scaled = float(gap) * float(CURRICULUM_ZONE_SCALE)
     return float(np.clip(scaled, float(CURRICULUM_MIN_HALF_WIDTH), float(TARGET_ZONE_HALF_WIDTH)))
+
+
+def cv2_progress_fraction(d2_A: float) -> float:
+    """Return 0..1 CV2 progress with configurable direction."""
+    start = float(CURRENT_DISTANCE2)
+    target = float(FINAL_TARGET2)
+    direction = str(globals().get("CV2_PROGRESS_DIRECTION", "decrease")).strip().lower()
+    if direction == "increase":
+        den = max(1e-6, target - start)
+        val = (float(d2_A) - start) / den
+    else:
+        den = max(1e-6, start - target)
+        val = (start - float(d2_A)) / den
+    return float(np.clip(val, 0.0, 1.0))
 
 # --------------------- module self-alias (for parity with combined.py) ---------------------
 config = _sys.modules[__name__]
@@ -372,6 +409,7 @@ def export_episode_metadata(
     curriculum_target_center_A=None,
     curriculum_target_zone=None,
     target_stage=None,
+    restart_metadata=None,
 ) -> None:
     meta_dir = _ensure(f"{config.RESULTS_DIR}/episode_meta/")
     bias_cols = ["step", "kind", "amp_kcal", "center1_A", "center2_A", "sigma_x_A", "sigma_y_A"]
@@ -379,11 +417,21 @@ def export_episode_metadata(
         "episode": int(episode_num),
         "bias_log_columns": bias_cols,
         "bias_log": [list(x) for x in bias_log],
+        "bias_mode": _normalized_bias_mode(),
+        "cv1_label": str(config.CV1_LABEL),
+        "cv2_label": str(config.CV2_LABEL),
+        "cv1_axis_label": str(getattr(config, "CV1_AXIS_LABEL", f"{config.CV1_LABEL} (A)")),
+        "cv2_axis_label": str(getattr(config, "CV2_AXIS_LABEL", f"{config.CV2_LABEL} (A)")),
+        "cv1_atoms": [int(config.ATOM1_INDEX), int(config.ATOM2_INDEX)],
+        "cv2_atoms": [int(config.ATOM3_INDEX), int(config.ATOM4_INDEX)],
+        "cv2_progress_direction": str(getattr(config, "CV2_PROGRESS_DIRECTION", "decrease")),
         "backstops_A": list(map(float, backstops_A or [])),
         "backstop_events": [list(map(float, x)) for x in (backstop_events or [])],
         "start_A": float(config.CURRENT_DISTANCE),
         "target_center_A": float(config.TARGET_CENTER),
         "target_zone": [float(config.TARGET_MIN), float(config.TARGET_MAX)],
+        "target2_center_A": float(config.TARGET2_CENTER),
+        "target2_zone": [float(config.TARGET2_MIN), float(config.TARGET2_MAX)],
         "curriculum_target_center_A": float(
             config.TARGET_CENTER if curriculum_target_center_A is None else curriculum_target_center_A
         ),
@@ -392,6 +440,7 @@ def export_episode_metadata(
             float(config.TARGET_MAX if curriculum_target_zone is None else curriculum_target_zone[1]),
         ],
         "target_stage": None if target_stage is None else int(target_stage),
+        "restart_metadata": dict(restart_metadata or {}),
     }
     with open(os.path.join(meta_dir, f"episode_{episode_num:04d}.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -540,7 +589,7 @@ def plot_distance_trajectory(
     plt.axhspan(config.TARGET_MIN, config.TARGET_MAX, alpha=0.18, label="Target zone (CV1)")
     plt.axhline(config.TARGET_CENTER, linestyle="--", linewidth=1.0, label="Target center")
     plt.xlabel("Time (ps)")
-    plt.ylabel(f"{config.CV1_LABEL} (Å)")
+    plt.ylabel(config.CV1_AXIS_LABEL)
     plt.title(f"Episode {episode_num:04d} CV1 trajectory")
     plt.legend()
     out_png = os.path.join(plot_dir, f"progressive_traj_ep_{episode_num:04d}_cv1.png")
@@ -576,8 +625,8 @@ def plot_distance_trajectory(
             plt.axvspan(config.TARGET_MIN, config.TARGET_MAX, alpha=0.15)
             plt.axhspan(config.TARGET2_MIN, config.TARGET2_MAX, alpha=0.12)
 
-            plt.xlabel(f"{config.CV1_LABEL} (Å)")
-            plt.ylabel(f"{config.CV2_LABEL} (Å)")
+            plt.xlabel(config.CV1_AXIS_LABEL)
+            plt.ylabel(config.CV2_AXIS_LABEL)
             plt.title(f"Episode {episode_num:04d} CV1 vs CV2 (colored by time)")
             out2d_png = os.path.join(plot_dir, f"progressive_traj_ep_{episode_num:04d}_cv1_cv2_2d.png")
             plt.tight_layout()
@@ -604,7 +653,7 @@ def plot_distance_trajectory(
         plt.axhspan(config.TARGET2_MIN, config.TARGET2_MAX, alpha=0.15, label="Target zone (CV2)")
         plt.axhline(config.TARGET2_CENTER, linestyle="--", linewidth=1.0, label="CV2 center")
         plt.xlabel("Time (ps)")
-        plt.ylabel(f"{config.CV2_LABEL} (Å)")
+        plt.ylabel(config.CV2_AXIS_LABEL)
         plt.title(f"Episode {episode_num:04d} CV2 trajectory")
         plt.legend()
         out2_png = os.path.join(plot_dir, f"progressive_traj_ep_{episode_num:04d}_cv2.png")
@@ -619,48 +668,76 @@ def plot_distance_trajectory(
         print(f"Saved CV2 CSV: {out2_csv}")
 
 def save_episode_bias_profiles(all_biases, episode_num: int):
-    """Save total 2D bias surface (sum of 2D Gaussians)."""
+    """Save the total bias surface for the active bias mode."""
     if not all_biases:
         return
 
     out_dir = _ensure(config.BIAS_PROFILE_DIR)
-
-    centers1 = np.array([b[1] for b in all_biases], dtype=float)
-    centers2 = np.array([b[2] for b in all_biases], dtype=float)
-    widths1 = np.array([max(1e-6, b[3]) for b in all_biases], dtype=float)
-    widths2 = np.array([max(1e-6, b[4]) for b in all_biases], dtype=float)
-
+    bias_mode = _normalized_bias_mode()
     pad = float(config.BIAS_PROFILE_PAD_SIGMA)
-    lo1 = float(np.min(centers1 - pad * widths1)) if centers1.size else max(0.5, float(config.CURRENT_DISTANCE) - 1.0)
-    hi1 = float(np.max(centers1 + pad * widths1)) if centers1.size else float(config.FINAL_TARGET) + 1.0
-    lo2 = float(np.min(centers2 - pad * widths2)) if centers2.size else max(0.5, float(config.FINAL_TARGET2) - 1.0)
-    hi2 = float(np.max(centers2 + pad * widths2)) if centers2.size else (
-        float(config.CURRENT_DISTANCE2) + 1.0 if config.CURRENT_DISTANCE2 is not None else 10.0
-    )
+    bins = int(config.BIAS_PROFILE_BINS)
 
-    x = np.linspace(min(lo1, float(config.CURRENT_DISTANCE) - 1.0), max(hi1, float(config.FINAL_TARGET) + 1.0),
-                    int(config.BIAS_PROFILE_BINS))
-    y = np.linspace(min(lo2, float(config.FINAL_TARGET2) - 1.0), max(hi2, float(config.CURRENT_DISTANCE2) + 1.0),
-                    int(config.BIAS_PROFILE_BINS))
-    X, Y = np.meshgrid(x, y)
-    Z = np.zeros_like(X, dtype=np.float64)
-    for amp, c1, c2, sx, sy in all_biases:
-        sx = max(1e-6, float(sx))
-        sy = max(1e-6, float(sy))
-        Z += float(amp) * np.exp(-((X - float(c1)) ** 2) / (2.0 * sx ** 2)
-                                 -((Y - float(c2)) ** 2) / (2.0 * sy ** 2))
+    if bias_mode == "1d":
+        centers1 = np.array([b[1] for b in all_biases], dtype=float)
+        widths1 = np.array([max(1e-6, b[2]) for b in all_biases], dtype=float)
+        lo1 = float(np.min(centers1 - pad * widths1)) if centers1.size else max(0.5, float(config.CURRENT_DISTANCE) - 1.0)
+        hi1 = float(np.max(centers1 + pad * widths1)) if centers1.size else float(config.FINAL_TARGET) + 1.0
+        cv2_refs = [
+            float(config.TARGET2_MIN),
+            float(config.TARGET2_MAX),
+            float(config.FINAL_TARGET2),
+            float(config.CURRENT_DISTANCE2),
+        ]
+        lo2 = min(cv2_refs) - 1.0
+        hi2 = max(cv2_refs) + 1.0
 
-    png = os.path.join(out_dir, f"ep_{episode_num:04d}_bias2d.png")
-    npy = os.path.join(out_dir, f"ep_{episode_num:04d}_bias2d.npy")
+        x = np.linspace(min(lo1, float(config.CURRENT_DISTANCE) - 1.0), max(hi1, float(config.FINAL_TARGET) + 1.0), bins)
+        y = np.linspace(lo2, hi2, bins)
+        X, _ = np.meshgrid(x, y)
+        Z = np.zeros((y.size, x.size), dtype=np.float64)
+        for amp, c1, sx in all_biases:
+            sx = max(1e-6, float(sx))
+            Z += float(amp) * np.exp(-((X - float(c1)) ** 2) / (2.0 * sx ** 2))
+        png = os.path.join(out_dir, f"ep_{episode_num:04d}_bias1d.png")
+        npy = os.path.join(out_dir, f"ep_{episode_num:04d}_bias1d.npy")
+        title = f"Episode {episode_num:04d} 1D Bias Surface (extruded over CV2)"
+    else:
+        centers1 = np.array([b[1] for b in all_biases], dtype=float)
+        centers2 = np.array([b[2] for b in all_biases], dtype=float)
+        widths1 = np.array([max(1e-6, b[3]) for b in all_biases], dtype=float)
+        widths2 = np.array([max(1e-6, b[4]) for b in all_biases], dtype=float)
+        lo1 = float(np.min(centers1 - pad * widths1)) if centers1.size else max(0.5, float(config.CURRENT_DISTANCE) - 1.0)
+        hi1 = float(np.max(centers1 + pad * widths1)) if centers1.size else float(config.FINAL_TARGET) + 1.0
+        cv2_refs = [
+            float(config.TARGET2_MIN),
+            float(config.TARGET2_MAX),
+            float(config.FINAL_TARGET2),
+            float(config.CURRENT_DISTANCE2),
+        ]
+        lo2 = float(np.min(centers2 - pad * widths2)) if centers2.size else min(cv2_refs) - 1.0
+        hi2 = float(np.max(centers2 + pad * widths2)) if centers2.size else max(cv2_refs) + 1.0
+
+        x = np.linspace(min(lo1, float(config.CURRENT_DISTANCE) - 1.0), max(hi1, float(config.FINAL_TARGET) + 1.0), bins)
+        y = np.linspace(min(lo2, min(cv2_refs) - 1.0), max(hi2, max(cv2_refs) + 1.0), bins)
+        X, Y = np.meshgrid(x, y)
+        Z = np.zeros_like(X, dtype=np.float64)
+        for amp, c1, c2, sx, sy in all_biases:
+            sx = max(1e-6, float(sx))
+            sy = max(1e-6, float(sy))
+            Z += float(amp) * np.exp(-((X - float(c1)) ** 2) / (2.0 * sx ** 2)
+                                     -((Y - float(c2)) ** 2) / (2.0 * sy ** 2))
+        png = os.path.join(out_dir, f"ep_{episode_num:04d}_bias2d.png")
+        npy = os.path.join(out_dir, f"ep_{episode_num:04d}_bias2d.npy")
+        title = f"Episode {episode_num:04d} 2D Bias Surface"
     np.save(npy, Z)
 
     plt.figure(figsize=(6.5, 5.5))
     plt.imshow(Z, origin="lower", aspect="auto", cmap="coolwarm",
                extent=[x.min(), x.max(), y.min(), y.max()])
     plt.colorbar(label="Bias (kcal/mol)")
-    plt.xlabel(f"{config.CV1_LABEL} (A)")
-    plt.ylabel(f"{config.CV2_LABEL} (A)")
-    plt.title(f"Episode {episode_num:04d} 2D Bias Surface")
+    plt.xlabel(config.CV1_AXIS_LABEL)
+    plt.ylabel(config.CV2_AXIS_LABEL)
+    plt.title(title)
     plt.tight_layout()
     plt.savefig(png, dpi=220)
     plt.close()
@@ -715,17 +792,19 @@ def _bias_energy_components(bias_log, backstops_A, xA_grid):
 
     for entry in bias_log:
         if len(entry) == 7:
-            # 2D Gaussian bias (skip for 1D projection)
-            continue
+            _, kind, amp_kcal, center_A, _, width_A, sigma_y_A = entry
+            if kind in ("gaussian2d", "bias2d") or sigma_y_A is not None:
+                continue
+            cv_id = 1
         if len(entry) == 6:
             _, cv_id, kind, amp_kcal, center_A, width_A = entry
-        else:
+        elif len(entry) != 7:
             continue
 
         # Only decompose CV1 Gaussian terms
         if int(cv_id) != 1:
             continue
-        if kind not in ("gaussian", "bias", "bias1"):
+        if kind not in ("gaussian", "bias", "bias1", "gaussian1d", "bias1d"):
             continue
 
         A_kJ = float(amp_kcal) * 4.184
@@ -877,8 +956,10 @@ def _checkpoint_config_snapshot():
         "TARGET_ZONE_HALF_WIDTH",
         "TARGET2_CENTER",
         "TARGET2_ZONE_HALF_WIDTH",
+        "BIAS_MODE",
         "MAX_ACTIONS_PER_EPISODE",
         "MAX_GAUSSIANS_PER_ACTION",
+        "MAX_BIAS_TERMS_PER_EPISODE",
         "LR",
         "GAMMA",
         "GAE_LAMBDA",
@@ -1721,10 +1802,7 @@ class ProteinEnvironmentRedesigned:
         p1 = (d1 - CURRENT_DISTANCE) / max(1e-6, (target_center_A - CURRENT_DISTANCE))  # CV1 outward
         p1 = float(np.clip(p1, 0.0, 1.0))
 
-        # CV2 inward (distance reduction): progress increases as d2 decreases
-        den2 = max(1e-6, (CURRENT_DISTANCE2 - FINAL_TARGET2))
-        p2 = (CURRENT_DISTANCE2 - d2) / den2
-        p2 = float(np.clip(p2, 0.0, 1.0))
+        p2 = cv2_progress_fraction(d2)
 
         # Stage-1 training is driven by CV1 unbinding.
         overall = p1
@@ -1941,6 +2019,30 @@ class ProteinEnvironmentRedesigned:
         self._dynamic_force_names["bias2d"] = bias_names
         return system
 
+    def _add_persistent_bias_force_1d(self, system, max_terms):
+        names_list = []
+        expr_terms = []
+        for idx in range(int(max_terms)):
+            names = {
+                "amp": f"bias1d_A_{idx}",
+                "x0": f"bias1d_x0_{idx}",
+                "sx": f"bias1d_sx_{idx}",
+            }
+            names_list.append(names)
+            expr_terms.append(
+                f"{names['amp']}*exp(-((r-{names['x0']})^2)/(2*{names['sx']}^2))"
+            )
+
+        force = openmm.CustomBondForce(" + ".join(expr_terms) if expr_terms else "0")
+        for names in names_list:
+            force.addGlobalParameter(names["amp"], 0.0)
+            force.addGlobalParameter(names["x0"], 0.0)
+            force.addGlobalParameter(names["sx"], 1.0)
+        force.addBond(self.atom1_idx, self.atom2_idx)
+        system.addForce(force)
+        self._dynamic_force_names["bias1d"] = names_list
+        return system
+
     def _add_persistent_backstop_force(self, system, max_terms):
         names_list = []
         expr_terms = []
@@ -1997,7 +2099,10 @@ class ProteinEnvironmentRedesigned:
         system = self._add_switchable_cap_force(system, "zone2_lower", self.atom3_idx, self.atom4_idx, "lower", CV2_ZONE_K)
         system = self._add_switchable_cap_force(system, "zone2_upper", self.atom3_idx, self.atom4_idx, "upper", CV2_ZONE_K)
         system = self._add_switchable_center_force(system, "cv2_center", self.atom3_idx, self.atom4_idx, CV2_CENTER_K)
-        system = self._add_persistent_bias_force_2d(system, MAX_BIAS_TERMS_PER_EPISODE)
+        if _normalized_bias_mode() == "1d":
+            system = self._add_persistent_bias_force_1d(system, MAX_BIAS_TERMS_PER_EPISODE)
+        else:
+            system = self._add_persistent_bias_force_2d(system, MAX_BIAS_TERMS_PER_EPISODE)
         return system
 
     def _set_context_parameter(self, name, value):
@@ -2039,6 +2144,21 @@ class ProteinEnvironmentRedesigned:
             self._set_context_parameter(names["center"], 0.0)
 
     def _sync_bias_parameters(self):
+        if _normalized_bias_mode() == "1d":
+            slots = self._dynamic_force_names.get("bias1d", [])
+            active = list(self.all_biases_in_episode)
+            for idx, names in enumerate(slots):
+                if idx < len(active):
+                    amp, c1, sx = active[idx]
+                    self._set_context_parameter(names["amp"], float(amp) * 4.184)
+                    self._set_context_parameter(names["x0"], float(c1) / 10.0)
+                    self._set_context_parameter(names["sx"], max(1e-6, float(sx) / 10.0))
+                else:
+                    self._set_context_parameter(names["amp"], 0.0)
+                    self._set_context_parameter(names["x0"], 0.0)
+                    self._set_context_parameter(names["sx"], 1.0)
+            return
+
         slots = self._dynamic_force_names.get("bias2d", [])
         active = list(self.all_biases_in_episode)
         for idx, names in enumerate(slots):
@@ -2108,49 +2228,61 @@ class ProteinEnvironmentRedesigned:
         if CV2_CENTER_RESTRAINT and getattr(self, "cv2_center_on", False):
             system = self._add_center_harmonic_cv2(system, self._cv2_center)
 
-        bias_2d = list(self.all_biases_in_episode)
-        if bias_2d:
-            system = self._add_gaussian_biases_2d(system, bias_2d)
+        if self.all_biases_in_episode:
+            if _normalized_bias_mode() == "1d":
+                system = self._add_gaussian_biases(
+                    system,
+                    self.atom1_idx,
+                    self.atom2_idx,
+                    list(self.all_biases_in_episode),
+                )
+            else:
+                system = self._add_gaussian_biases_2d(system, list(self.all_biases_in_episode))
 
         return system
 
     # ---------- action → 2D Gaussian parameters ----------
-    def smart_progressive_bias(self, action: int):
-        target_center_A, target_min_A, target_max_A, _ = self.final_target_zone()
-        A_bins = AMP_BINS
-        dx_bins = DX_BINS
-        dy_bins = DY_BINS
-        s_bins = SIGMA_BINS
+    def _decode_bias_action(self, action: int):
+        if _normalized_bias_mode() == "1d":
+            n_dx = len(DX_BINS)
+            n_s = len(SIGMA_BINS)
+            n_total = len(AMP_BINS) * n_dx * n_s
+            action = int(max(0, min(action, n_total - 1)))
+            amp_idx = action // (n_dx * n_s)
+            rem = action % (n_dx * n_s)
+            dx_idx = rem // n_s
+            s_idx = rem % n_s
+            dy_idx = None
+        else:
+            n_dx = len(DX_BINS)
+            n_dy = len(DY_BINS)
+            n_s = len(SIGMA_BINS)
+            n_total = len(AMP_BINS) * n_dx * n_dy * n_s
+            action = int(max(0, min(action, n_total - 1)))
+            amp_idx = action // (n_dx * n_dy * n_s)
+            rem = action % (n_dx * n_dy * n_s)
+            dx_idx = rem // (n_dy * n_s)
+            rem2 = rem % (n_dy * n_s)
+            dy_idx = rem2 // n_s
+            s_idx = rem2 % n_s
 
-        n_dx = len(dx_bins)
-        n_dy = len(dy_bins)
-        n_s = len(s_bins)
-        n_total = len(A_bins) * n_dx * n_dy * n_s
-
-        action = int(max(0, min(action, n_total - 1)))
-        amp_idx = action // (n_dx * n_dy * n_s)
-        rem = action % (n_dx * n_dy * n_s)
-        dx_idx = rem // (n_dy * n_s)
-        rem2 = rem % (n_dy * n_s)
-        dy_idx = rem2 // n_s
-        s_idx = rem2 % n_s
-
-        base_amp = float(A_bins[amp_idx])
-        base_dx = float(dx_bins[dx_idx])
-        base_dy = float(dy_bins[dy_idx])
-        base_sigma = float(s_bins[s_idx])
-        dx_min = float(min(dx_bins))
-        dx_max = float(max(dx_bins))
+        base_amp = float(AMP_BINS[amp_idx])
+        base_dx = float(DX_BINS[dx_idx])
+        base_dy = 0.0 if dy_idx is None else float(DY_BINS[dy_idx])
+        base_sigma = float(SIGMA_BINS[s_idx])
+        dx_min = float(min(DX_BINS))
+        dx_max = float(max(DX_BINS))
         dx_span = max(1e-6, dx_max - dx_min)
         forward_signal = float(np.clip((base_dx - dx_min) / dx_span, 0.0, 1.0))
+        return base_amp, base_dx, base_dy, base_sigma, forward_signal
 
-        # Progress scaling (same logic as before)
+    def smart_progressive_bias(self, action: int):
+        target_center_A, target_min_A, target_max_A, _ = self.final_target_zone()
+        bias_mode = _normalized_bias_mode()
+        base_amp, base_dx, base_dy, base_sigma, forward_signal = self._decode_bias_action(action)
+
         p1 = (self.current_distance - CURRENT_DISTANCE) / max(1e-6, (target_center_A - CURRENT_DISTANCE))
         p1 = float(np.clip(p1, 0.0, 1.0))
-
-        den2 = max(1e-6, (CURRENT_DISTANCE2 - FINAL_TARGET2))
-        p2 = (CURRENT_DISTANCE2 - self.current_distance2) / den2
-        p2 = float(np.clip(p2, 0.0, 1.0))
 
         progress = p1
         remaining = max(0.0, float(target_center_A) - float(self.current_distance))
@@ -2203,17 +2335,6 @@ class ProteinEnvironmentRedesigned:
         )
         span_offset = float(np.clip(span_offset, 0.25, RIBBON_CV1_BACK_OFFSET_MAX_A))
 
-        sigma_x_values = [
-            float(sigma),
-            float(np.clip(sigma * RIBBON_SECONDARY_SIGMA_X_SCALE, MIN_WIDTH, MAX_WIDTH)),
-            float(np.clip(sigma * RIBBON_TERTIARY_SIGMA_X_SCALE, MIN_WIDTH, MAX_WIDTH)),
-        ]
-        sigma_y = float(np.clip(sigma * RIBBON_SIGMA_Y_SCALE, MIN_WIDTH, MAX_WIDTH))
-
-        spread = float(RIBBON_CV2_SPREAD_A + RIBBON_CV2_SPREAD_SCALE * abs(float(base_dy)))
-        spread = float(np.clip(spread, 0.25, 2.0))
-        y_center = float(self.current_distance2 + (RIBBON_CV2_SHIFT_SCALE * float(base_dy)))
-
         max_center1 = max(0.52, float(self.current_distance) - 0.02)
         frontier_step = (
             float(BIAS_FRONTIER_STEP_A)
@@ -2224,6 +2345,30 @@ class ProteinEnvironmentRedesigned:
         if self._bias_primary_frontier_A is not None and remaining > 0.35:
             frontier_min = min(max_center1, float(self._bias_primary_frontier_A) + frontier_step)
             primary_center = float(np.clip(max(primary_center, frontier_min), 0.5, max_center1))
+
+        if bias_mode == "1d":
+            if base_dx < 0.0:
+                primary_center = float(np.clip(primary_center + 0.20 * abs(base_dx), 0.5, max_center1))
+            width_1d = float(np.clip(sigma * (1.0 + 0.12 * abs(base_dx)), MIN_WIDTH, MAX_WIDTH))
+            self._bias_primary_frontier_A = float(primary_center)
+            return [
+                (
+                    "gaussian1d",
+                    float(np.clip(amp, MIN_AMP, min(MAX_AMP, APPLIED_MAX_AMP))),
+                    float(primary_center),
+                    float(width_1d),
+                )
+            ]
+
+        sigma_x_values = [
+            float(sigma),
+            float(np.clip(sigma * RIBBON_SECONDARY_SIGMA_X_SCALE, MIN_WIDTH, MAX_WIDTH)),
+            float(np.clip(sigma * RIBBON_TERTIARY_SIGMA_X_SCALE, MIN_WIDTH, MAX_WIDTH)),
+        ]
+        sigma_y = float(np.clip(sigma * RIBBON_SIGMA_Y_SCALE, MIN_WIDTH, MAX_WIDTH))
+        spread = float(RIBBON_CV2_SPREAD_A + RIBBON_CV2_SPREAD_SCALE * abs(float(base_dy)))
+        spread = float(np.clip(spread, 0.25, 2.0))
+        y_center = float(self.current_distance2 + (RIBBON_CV2_SHIFT_SCALE * float(base_dy)))
 
         secondary_offset = max(near_offset + 0.55 * span_offset, self.current_distance - primary_center + 0.20)
         tertiary_offset = max(near_offset + span_offset, secondary_offset + 0.25)
@@ -2273,7 +2418,10 @@ class ProteinEnvironmentRedesigned:
             self.best_distance_ever = float(self.current_distance)
             self.best_positions = None if self.current_positions is None else self.current_positions
 
-        if self.current_distance2 < getattr(self, "best_distance2_ever", float("inf")):
+        if str(globals().get("CV2_PROGRESS_DIRECTION", "decrease")).strip().lower() == "increase":
+            if self.current_distance2 > getattr(self, "best_distance2_ever", float("-inf")):
+                self.best_distance2_ever = float(self.current_distance2)
+        elif self.current_distance2 < getattr(self, "best_distance2_ever", float("inf")):
             self.best_distance2_ever = float(self.current_distance2)
 
     def reset(
@@ -2284,6 +2432,7 @@ class ProteinEnvironmentRedesigned:
         target_center_A=None,
         target_half_width_A=None,
         target_stage=None,
+        restart_pdb_path=None,
     ):
         # set / clear milestone bookkeeping
         self.milestones_hit = set()
@@ -2315,14 +2464,28 @@ class ProteinEnvironmentRedesigned:
 
         # MD state
         if not carry_state:
-            self.current_positions = None
-            self._last_positions = None
+            if restart_pdb_path:
+                restart_pdb_path = os.path.abspath(str(restart_pdb_path))
+                restart_pdb = PDBFile(restart_pdb_path)
+                if len(restart_pdb.positions) != len(self.pdb.positions):
+                    raise ValueError(
+                        f"Restart PDB atom count mismatch: {restart_pdb_path} has "
+                        f"{len(restart_pdb.positions)} atoms, expected {len(self.pdb.positions)}."
+                    )
+                self.current_positions = restart_pdb.positions
+                self._last_positions = restart_pdb.positions
+                self.hybrid_restart_pdb_path = restart_pdb_path
+            else:
+                self.current_positions = None
+                self._last_positions = None
+                self.hybrid_restart_pdb_path = None
         else:
             # Resume from the best-reaching structure when available.
             if self.best_positions is not None:
                 self._last_positions = self.best_positions
             else:
                 self._last_positions = self.current_positions
+            self.hybrid_restart_pdb_path = None
             
         self.current_velocities = None   # never carry velocities
         self._last_topology = None
@@ -2412,30 +2575,44 @@ class ProteinEnvironmentRedesigned:
         biases = self.smart_progressive_bias(action_index)
         if (len(self.all_biases_in_episode) + len(biases)) > int(MAX_BIAS_TERMS_PER_EPISODE):
             raise RuntimeError(
-                f"Exceeded preallocated 2D bias slots: "
+                f"Exceeded preallocated bias slots: "
                 f"{len(self.all_biases_in_episode) + len(biases)} > {MAX_BIAS_TERMS_PER_EPISODE}. "
-                f"Increase MAX_GAUSSIANS_PER_ACTION or MAX_BIAS_TERMS_PER_EPISODE."
+                f"Increase MAX_BIAS_TERMS_PER_EPISODE or reduce per-action bias terms."
             )
 
         self.step_counter += 1
         for b in biases:
-            if len(b) == 6:
+            if len(b) == 4:
+                kind, amp_kcal, center1_A, sigma_x_A = b
+                amp_kcal = float(min(float(amp_kcal), float(APPLIED_MAX_AMP)))
+                sigma_x_A = float(max(float(sigma_x_A), 0.3))
+                self.all_biases_in_episode.append(
+                    (float(amp_kcal), float(center1_A), float(sigma_x_A))
+                )
+                self.bias_log.append(
+                    (
+                        self.step_counter,
+                        str(kind),
+                        float(amp_kcal),
+                        float(center1_A),
+                        float(self.current_distance2),
+                        float(sigma_x_A),
+                        None,
+                    )
+                )
+            elif len(b) == 6:
                 kind, amp_kcal, center1_A, center2_A, sigma_x_A, sigma_y_A = b
+                amp_kcal = float(min(float(amp_kcal), float(APPLIED_MAX_AMP)))
+                sigma_x_A = float(max(float(sigma_x_A), 0.3))
+                sigma_y_A = float(max(float(sigma_y_A), 0.3))
+                self.all_biases_in_episode.append(
+                    (float(amp_kcal), float(center1_A), float(center2_A), float(sigma_x_A), float(sigma_y_A))
+                )
+                self.bias_log.append(
+                    (self.step_counter, str(kind), float(amp_kcal), float(center1_A), float(center2_A), float(sigma_x_A), float(sigma_y_A))
+                )
             else:
                 raise ValueError(f"Unexpected bias tuple length={len(b)}: {b}")
-
-            amp_kcal = float(min(float(amp_kcal), float(APPLIED_MAX_AMP)))
-            sigma_x_A = float(max(float(sigma_x_A), 0.3))
-            sigma_y_A = float(max(float(sigma_y_A), 0.3))
-
-            self.all_biases_in_episode.append(
-                (float(amp_kcal), float(center1_A), float(center2_A), float(sigma_x_A), float(sigma_y_A))
-            )
-
-            # bias_log keeps (step, kind, amp, center1, center2, sigma_x, sigma_y)
-            self.bias_log.append(
-                (self.step_counter, str(kind), float(amp_kcal), float(center1_A), float(center2_A), float(sigma_x_A), float(sigma_y_A))
-            )
         self._bias_slots_used = len(self.all_biases_in_episode)
 
         gamma = fricCoef
@@ -2545,8 +2722,12 @@ class ProteinEnvironmentRedesigned:
         inward = max(0.0, -delta1)
 
         delta2 = self.current_distance2 - prev_d2
-        inward2 = max(0.0, -delta2)    # good: d2 decreases
-        outward2 = max(0.0, delta2)    # bad: d2 increases
+        if str(globals().get("CV2_PROGRESS_DIRECTION", "decrease")).strip().lower() == "increase":
+            progress2 = max(0.0, delta2)
+            backtrack2 = max(0.0, -delta2)
+        else:
+            progress2 = max(0.0, -delta2)
+            backtrack2 = max(0.0, delta2)
 
         reward = 0.0
         done = False
@@ -2575,7 +2756,7 @@ class ProteinEnvironmentRedesigned:
             reward += PROGRESS_REWARD * outward
 
             # CV2 is a soft shaping term only.
-            reward += CV2_PROGRESS_REWARD_SCALE * PROGRESS_REWARD * inward2
+            reward += CV2_PROGRESS_REWARD_SCALE * PROGRESS_REWARD * progress2
 
             # milestones on CV1
             for m in DISTANCE_INCREMENTS:
@@ -2590,7 +2771,7 @@ class ProteinEnvironmentRedesigned:
                 reward += BACKTRACK_PENALTY * inward
                 self.no_improve_counter += 1
 
-            reward += CV2_PROGRESS_REWARD_SCALE * BACKTRACK_PENALTY * outward2
+            reward += CV2_PROGRESS_REWARD_SCALE * BACKTRACK_PENALTY * backtrack2
 
             reward += STEP_PENALTY
         

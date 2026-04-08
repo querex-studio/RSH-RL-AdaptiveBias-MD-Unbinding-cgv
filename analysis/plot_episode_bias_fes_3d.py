@@ -20,6 +20,7 @@ from analysis.plot_episode_bias_fes import (
     _bias_surface_like_profile,
     _episode_paths,
     _frame_biases,
+    _axis_label,
     _load_bias_log,
     _load_traj,
 )
@@ -118,7 +119,9 @@ def make_plot(episode_num: int, temperature: float = 300.0, bins: int = 140):
     weights = np.exp(beta * frame_bias)
 
     target_x = float(meta.get("target_center_A", config.TARGET_CENTER))
-    target_y = float(config.TARGET2_CENTER)
+    target_y = float(meta.get("target2_center_A", config.TARGET2_CENTER))
+    cv1_axis_label = _axis_label(meta, "cv1", getattr(config, "CV1_LABEL", "CV1"))
+    cv2_axis_label = _axis_label(meta, "cv2", getattr(config, "CV2_LABEL", "CV2"))
     bias_x, bias_y, bias_surface = _bias_surface_like_profile(bias_log)
     x_min, x_max, y_min, y_max = _combined_limits(cv1, cv2, target_x, target_y, bias_x, bias_y, bias_surface)
     x_grid, y_grid, fes = _histogram_fes(
@@ -227,8 +230,8 @@ def make_plot(episode_num: int, temperature: float = 300.0, bins: int = 140):
     ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(0.02, 0.98), frameon=True, framealpha=0.94)
 
     ax.set_title(f"Episode {episode_num} | 3D Unbiased FES + Bias Projection")
-    ax.set_xlabel("CV1 (atom 7799 - atom 7840 distance) (Å)", labelpad=10)
-    ax.set_ylabel("CV2 (atom 487 - atom 3789 distance) (Å)", labelpad=10)
+    ax.set_xlabel(cv1_axis_label, labelpad=10)
+    ax.set_ylabel(cv2_axis_label, labelpad=10)
     ax.set_zlabel("Unbiased FES (kcal/mol)", labelpad=10)
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)

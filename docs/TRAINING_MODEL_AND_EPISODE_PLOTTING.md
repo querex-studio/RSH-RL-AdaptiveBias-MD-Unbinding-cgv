@@ -9,13 +9,17 @@ Primary source files:
 - [analysis/plot_episode_bias_fes.py](../analysis/plot_episode_bias_fes.py)
 - [analysis/plot_episode_bias_fes_3d.py](../analysis/plot_episode_bias_fes_3d.py)
 - [analysis/stacked_imshow_slices.py](../analysis/stacked_imshow_slices.py)
+- [analysis/tica_phosphate_pathway.py](../analysis/tica_phosphate_pathway.py), downstream slow-mode analysis of saved trajectories
+- [analysis/cv2_autoselect.py](../analysis/cv2_autoselect.py), downstream CV2 candidate ranking
+- [analysis/hybrid_restart_selection.py](../analysis/hybrid_restart_selection.py), downstream hybrid restart selection from TICA or PCA candidates
+- [analysis/hybrid_auto_controller.py](../analysis/hybrid_auto_controller.py), closed-loop round-level hybrid PPO controller
 
 ## 1. Training Model Overview
 
 The project trains a PPO agent to bias OpenMM MD in a 2D collective-variable space:
 
-- `CV1`: main unbinding coordinate
-- `CV2`: auxiliary coordinate / corridor coordinate
+- `CV1`: main Mg-phosphate P unbinding coordinate, atom `7799` to atom `7840`
+- `CV2`: auxiliary Mg-phosphate O2 coordinate, atom `7799` to atom `7842`
 
 High-level flow:
 
@@ -27,6 +31,10 @@ High-level flow:
 6. MD is propagated.
 7. Reward is computed from CV1 progress, milestones, stability, and optional CV2 shaping.
 8. PPO updates from the collected rollout.
+
+Downstream note: PCA, TICA, and hybrid restart selection are not part of the online PPO training loop. They are run after training on saved DCD trajectories to interpret Mg-phosphate unbinding modes, rank restart/evaluation candidates, export restart PDBs, and plot two candidate transition pathways on PCA- or TICA-space `free energy / kT` maps.
+
+Automated hybrid note: [scripts/hybrid_auto.py](../scripts/hybrid_auto.py) can use PCA/TICA-selected restart PDBs between PPO rounds. Restart episodes use the final target zone and do not promote the fresh-start curriculum; this keeps the original bound-state task separate from late-stage restart training.
 
 ## 2. Main Configuration Location
 
@@ -62,6 +70,7 @@ Defined in [combined_2d.py](../combined_2d.py):
 | `ATOM3_INDEX`, `ATOM4_INDEX` | CV2 atom pair |
 | `ATOM_PAIRS` | Optional override pair list |
 | `CV1_LABEL`, `CV2_LABEL` | Plot labels |
+| `CV1_AXIS_LABEL`, `CV2_AXIS_LABEL` | Full axis labels with units |
 
 Distance calculation:
 
@@ -93,11 +102,14 @@ CV2 corridor parameters:
 | `TARGET2_CENTER` | Active CV2 corridor center |
 | `TARGET2_ZONE_HALF_WIDTH` | CV2 corridor half-width |
 | `TARGET2_MIN`, `TARGET2_MAX` | Derived CV2 corridor bounds |
+| `CV2_PROGRESS_DIRECTION` | `decrease` for closing contacts, `increase` for unbinding-like distances |
 
 Rules:
 
 - `CURRENT_DISTANCE` and `CURRENT_DISTANCE2` are used in state and progress formulas.
 - Keep the final physical target separate from curriculum targets.
+- The active Mg-O2 `CV2` uses `CV2_PROGRESS_DIRECTION = "increase"`.
+- For existing older results generated before this change, `CV2` may still refer to the previous auxiliary atom pair `487-3789`; use the episode metadata and labels when interpreting plots.
 
 ### 3.4 Curriculum and milestone logic
 
@@ -212,7 +224,7 @@ stability = 1 / (1 + std(last_5_cv1_values))
 
 ```text
 p1 = clip((d1 - CURRENT_DISTANCE) / (active_target_center - CURRENT_DISTANCE), 0, 1)
-p2 = clip((CURRENT_DISTANCE2 - d2) / (CURRENT_DISTANCE2 - FINAL_TARGET2), 0, 1)
+p2 = clip((d2 - CURRENT_DISTANCE2) / (FINAL_TARGET2 - CURRENT_DISTANCE2), 0, 1)  # for active increase-mode CV2
 overall_progress = p1
 ```
 
@@ -326,9 +338,14 @@ final target:
 - used for stable success / episode termination
 ```
 
-## 4. 2D Gaussian Bias Logic
+## 4. Gaussian Bias Logic
 
 Location: `ProteinEnvironmentRedesigned.smart_progressive_bias()` in [combined_2d.py](../combined_2d.py)
+
+The active bias dimensionality is controlled by `BIAS_MODE` in [combined_2d.py](../combined_2d.py):
+
+- `1d`: default; deposits a single Gaussian along `CV1`
+- `2d`: deposits the existing three-hill ribbon in `(CV1, CV2)`
 
 Bias construction parameters:
 
@@ -518,3 +535,13 @@ Important output folders under `results_PPO/`:
 - `episode_pdbs/`: optional end-of-episode structures
 - `checkpoints/`: PPO checkpoints
 - `analysis_runs/episode_XXXX/`: per-episode analysis figures
+- `analysis_runs/<timestamp>/`: post-processing, PCA, and TICA analysis runs
+
+Typical downstream commands:
+
+```powershell
+python scripts\post_process.py --config-module combined_2d --episode-surfaces --all-trajectories
+python scripts\cv2_autoselect.py --config-module combined_2d --max-traj 0
+python scripts\pca.py --config-module combined_2d --max-traj 0
+python scripts\tica.py --config-module combined_2d --max-traj 0 --lag 5
+```

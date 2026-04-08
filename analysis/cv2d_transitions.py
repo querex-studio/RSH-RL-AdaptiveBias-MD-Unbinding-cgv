@@ -552,8 +552,8 @@ def main():
         sc = plt.scatter(cv1[indices], cv2[indices], c=color_val, s=args.point_size,
                          alpha=args.point_alpha, cmap="viridis", linewidths=0)
         plt.colorbar(sc, label=color_label)
-        plt.xlabel(f"{label_cv1} (distance, A)")
-        plt.ylabel(f"{label_cv2} (distance, A)")
+        plt.xlabel(f"{label_cv1} (A)")
+        plt.ylabel(f"{label_cv2} (A)")
         title = "Transition-Only CV1 vs CV2"
         if title_suffix:
             title = f"{title} ({title_suffix})"
@@ -600,8 +600,8 @@ def main():
                 plt.contour(counts_trans.T, levels=levels, colors="black",
                             extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]])
 
-        plt.xlabel(f"{label_cv1} (distance, A)")
-        plt.ylabel(f"{label_cv2} (distance, A)")
+        plt.xlabel(f"{label_cv1} (A)")
+        plt.ylabel(f"{label_cv2} (A)")
         title = "Transition Density Over FES"
         if title_suffix:
             title = f"{title} ({title_suffix})"

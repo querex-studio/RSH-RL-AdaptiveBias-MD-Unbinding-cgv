@@ -17,6 +17,10 @@ The evaluation pipeline is separate from training so that:
 
 The evaluator runs greedy fresh-start episodes against the final target zone and writes a dedicated report plus dashboard.
 
+For trajectory-space interpretation after evaluation or training, use [PCA_ANALYSIS.md](./PCA_ANALYSIS.md) and [TICA_ANALYSIS.md](./TICA_ANALYSIS.md). PCA/TICA are not evaluator replacements; they identify structural and slow-coordinate regions plus candidate restart frames from saved trajectories. For automatic `CV2` candidate ranking before changing the training config, use [CV_SELECTION.md](./CV_SELECTION.md). For Option-B restart PDB export and two-pathway F/kT plotting, use [HYBRID_RESTART_SELECTION.md](./HYBRID_RESTART_SELECTION.md).
+
+For the automatic round-level controller that uses PCA/TICA restart candidates in later PPO rounds, use [AUTOMATED_HYBRID_TRAINING.md](./AUTOMATED_HYBRID_TRAINING.md).
+
 ## 2. What It Measures
 
 Per checkpoint, the evaluator reports:
@@ -113,4 +117,41 @@ Recommended order:
 1. train the model
 2. evaluate checkpoints with `scripts/evaluate.py`
 3. inspect the dashboard and report
-4. only then decide whether the agent is trained enough for downstream use
+4. run CV2 auto-selection if the auxiliary CV needs revision
+5. run PCA on saved trajectories if you need structural-mode evidence or PCA-space restart candidates
+6. run TICA on saved trajectories if you need slow-mode evidence or seed-candidate frames
+7. run hybrid restart selection if you want PCA- or TICA-selected PDB restart structures
+8. optionally run automated hybrid training if restart-guided rounds are needed
+9. only then decide whether the agent is trained enough for downstream use
+
+CV2, PCA, and TICA commands:
+
+```powershell
+python scripts\cv2_autoselect.py --config-module combined_2d --max-traj 0
+```
+
+```powershell
+python scripts\pca.py --config-module combined_2d --max-traj 0
+```
+
+```powershell
+python scripts\tica.py --config-module combined_2d --max-traj 0 --lag 5
+```
+
+PCA-space hybrid restart selection from the first 10 episodes:
+
+```powershell
+python scripts\pca_hybrid_restart.py --config-module combined_2d --max-episode 10 --top-restarts 10
+```
+
+TICA-space hybrid restart selection from the first 10 episodes:
+
+```powershell
+python scripts\hybrid_restart.py --config-module combined_2d --max-episode 10 --top-restarts 10
+```
+
+Automated hybrid training:
+
+```powershell
+python scripts\hybrid_auto.py --rounds 2 --initial-episodes 10 --episodes-per-round 10 --restart-fraction 0.30 --analysis-space both --top-restarts 10
+```

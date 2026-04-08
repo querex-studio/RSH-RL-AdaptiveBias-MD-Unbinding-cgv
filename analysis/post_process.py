@@ -226,14 +226,16 @@ def _load_episode_bias_terms(meta_dir, ep_idx):
         if len(entry) < 7:
             continue
         kind = str(entry[1])
-        if kind not in ("gaussian2d", "bias2d"):
-            continue
         amp = float(entry[2])
         c1 = float(entry[3])
-        c2 = float(entry[4])
         sx = float(entry[5])
-        sy = float(entry[6])
-        terms.append((amp, c1, c2, sx, sy))
+        if kind in ("gaussian2d", "bias2d") or entry[6] is not None:
+            c2 = float(entry[4])
+            sy = float(entry[6])
+            terms.append({"kind": "2d", "amp": amp, "c1": c1, "c2": c2, "sx": sx, "sy": sy})
+        else:
+            c2 = None if entry[4] is None else float(entry[4])
+            terms.append({"kind": "1d", "amp": amp, "c1": c1, "c2": c2, "sx": sx, "sy": None})
     return terms
 
 
@@ -253,27 +255,35 @@ def _edges_from_centers(centers):
 def _bias_surface_from_terms(terms, cfg):
     if not terms:
         return None, None, None
-    centers1 = np.array([t[1] for t in terms], dtype=float)
-    centers2 = np.array([t[2] for t in terms], dtype=float)
-    widths1 = np.array([max(1e-6, t[3]) for t in terms], dtype=float)
-    widths2 = np.array([max(1e-6, t[4]) for t in terms], dtype=float)
+    centers1 = np.array([t["c1"] for t in terms], dtype=float)
+    widths1 = np.array([max(1e-6, t["sx"]) for t in terms], dtype=float)
 
     pad = float(getattr(cfg, "BIAS_PROFILE_PAD_SIGMA", 3.0))
     bins = int(getattr(cfg, "BIAS_PROFILE_BINS", 250))
     lo1 = float(np.min(centers1 - pad * widths1))
     hi1 = float(np.max(centers1 + pad * widths1))
-    lo2 = float(np.min(centers2 - pad * widths2))
-    hi2 = float(np.max(centers2 + pad * widths2))
+    terms_2d = [t for t in terms if t["kind"] == "2d"]
+    if terms_2d:
+        centers2 = np.array([t["c2"] for t in terms_2d], dtype=float)
+        widths2 = np.array([max(1e-6, t["sy"]) for t in terms_2d], dtype=float)
+        lo2 = float(np.min(centers2 - pad * widths2))
+        hi2 = float(np.max(centers2 + pad * widths2))
+    else:
+        lo2 = min(float(getattr(cfg, "TARGET2_MIN", 0.0)), float(getattr(cfg, "FINAL_TARGET2", 0.0)) - 1.0)
+        hi2 = max(float(getattr(cfg, "TARGET2_MAX", 1.0)), float(getattr(cfg, "CURRENT_DISTANCE2", 1.0)) + 1.0)
 
     x = np.linspace(lo1, hi1, bins)
     y = np.linspace(lo2, hi2, bins)
     X, Y = np.meshgrid(x, y)
     Z = np.zeros_like(X, dtype=np.float64)
-    for amp, c1, c2, sx, sy in terms:
-        sx = max(1e-6, float(sx))
-        sy = max(1e-6, float(sy))
-        Z += float(amp) * np.exp(-((X - float(c1)) ** 2) / (2.0 * sx ** 2)
-                                 -((Y - float(c2)) ** 2) / (2.0 * sy ** 2))
+    for term in terms:
+        sx = max(1e-6, float(term["sx"]))
+        if term["kind"] == "2d":
+            sy = max(1e-6, float(term["sy"]))
+            Z += float(term["amp"]) * np.exp(-((X - float(term["c1"])) ** 2) / (2.0 * sx ** 2)
+                                             -((Y - float(term["c2"])) ** 2) / (2.0 * sy ** 2))
+        else:
+            Z += float(term["amp"]) * np.exp(-((X - float(term["c1"])) ** 2) / (2.0 * sx ** 2))
     return x, y, Z
 
 
@@ -446,8 +456,8 @@ def plot_episode_bias_potential(run_dir, cfg, max_episodes=50, stride=1):
             ax.axhspan(cfg.TARGET2_MIN, cfg.TARGET2_MAX, alpha=0.08, color="white")
 
         ax.set_title(f"Episode {ep_idx:04d}")
-        ax.set_xlabel(f"{getattr(cfg, 'CV1_LABEL', 'CV1')} (A)" if cfg else "CV1 (A)")
-        ax.set_ylabel(f"{getattr(cfg, 'CV2_LABEL', 'CV2')} (A)" if cfg else "CV2 (A)")
+        ax.set_xlabel(getattr(cfg, "CV1_AXIS_LABEL", f"{getattr(cfg, 'CV1_LABEL', 'CV1')} (A)") if cfg else "CV1 (A)")
+        ax.set_ylabel(getattr(cfg, "CV2_AXIS_LABEL", f"{getattr(cfg, 'CV2_LABEL', 'CV2')} (A)") if cfg else "CV2 (A)")
         ax.legend(loc="upper right", frameon=True)
 
         cbar_bias = fig.colorbar(cf, cax=cax_bias)
@@ -510,8 +520,8 @@ def plot_all_trajectories(run_dir, cfg, stride=5, max_episodes=None):
     if cfg is not None and hasattr(cfg, "TARGET2_MIN") and hasattr(cfg, "TARGET2_MAX"):
         ax.axhspan(cfg.TARGET2_MIN, cfg.TARGET2_MAX, alpha=0.10, color="grey")
 
-    ax.set_xlabel(f"{getattr(cfg, 'CV1_LABEL', 'CV1')} (A)" if cfg else "CV1 (A)")
-    ax.set_ylabel(f"{getattr(cfg, 'CV2_LABEL', 'CV2')} (A)" if cfg else "CV2 (A)")
+    ax.set_xlabel(getattr(cfg, "CV1_AXIS_LABEL", f"{getattr(cfg, 'CV1_LABEL', 'CV1')} (A)") if cfg else "CV1 (A)")
+    ax.set_ylabel(getattr(cfg, "CV2_AXIS_LABEL", f"{getattr(cfg, 'CV2_LABEL', 'CV2')} (A)") if cfg else "CV2 (A)")
     ax.set_title("All Episode Trajectories (CV1 vs CV2)")
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
@@ -569,8 +579,8 @@ def plot_cv_trajectories(out_dir, traj_glob, top_path, cfg, max_plots=50, stride
         plt.figure(figsize=(9, 4.5))
         plt.plot(time_ps, cv1, linewidth=1.6)
         plt.xlabel("Time (ps)")
-        label_cv1 = getattr(cfg, "CV1_LABEL", "CV1 distance")
-        plt.ylabel(f"{label_cv1} (Å)")
+        label_cv1 = getattr(cfg, "CV1_AXIS_LABEL", f"{getattr(cfg, 'CV1_LABEL', 'CV1 distance')} (A)")
+        plt.ylabel(label_cv1)
         plt.title(f"{base} CV1 trajectory")
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"{base}_cv1.png"))
@@ -580,8 +590,8 @@ def plot_cv_trajectories(out_dir, traj_glob, top_path, cfg, max_plots=50, stride
         plt.figure(figsize=(9, 4.5))
         plt.plot(time_ps, cv2, linewidth=1.6)
         plt.xlabel("Time (ps)")
-        label_cv2 = getattr(cfg, "CV2_LABEL", "CV2 distance")
-        plt.ylabel(f"{label_cv2} (Å)")
+        label_cv2 = getattr(cfg, "CV2_AXIS_LABEL", f"{getattr(cfg, 'CV2_LABEL', 'CV2 distance')} (A)")
+        plt.ylabel(label_cv2)
         plt.title(f"{base} CV2 trajectory")
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"{base}_cv2.png"))
@@ -592,10 +602,10 @@ def plot_cv_trajectories(out_dir, traj_glob, top_path, cfg, max_plots=50, stride
         sc = plt.scatter(cv1, cv2, c=time_ps, s=8, cmap="viridis")
         cbar = plt.colorbar(sc)
         cbar.set_label("Time (ps)")
-        label_cv1 = getattr(cfg, "CV1_LABEL", "CV1 distance")
-        label_cv2 = getattr(cfg, "CV2_LABEL", "CV2 distance")
-        plt.xlabel(f"{label_cv1} (Å)")
-        plt.ylabel(f"{label_cv2} (Å)")
+        label_cv1 = getattr(cfg, "CV1_AXIS_LABEL", f"{getattr(cfg, 'CV1_LABEL', 'CV1 distance')} (A)")
+        label_cv2 = getattr(cfg, "CV2_AXIS_LABEL", f"{getattr(cfg, 'CV2_LABEL', 'CV2 distance')} (A)")
+        plt.xlabel(label_cv1)
+        plt.ylabel(label_cv2)
         plt.title(f"{base} CV1 vs CV2")
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"{base}_cv1_cv2.png"))

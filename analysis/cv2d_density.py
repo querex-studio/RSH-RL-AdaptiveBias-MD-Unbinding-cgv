@@ -573,8 +573,8 @@ def main():
         plt.imshow(prob_m.T, origin="lower", aspect="auto", cmap="magma",
                    extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]])
         plt.colorbar(label="P(CV1, CV2)")
-        plt.xlabel(f"{label_cv1} (distance, A)")
-        plt.ylabel(f"{label_cv2} (distance, A)")
+        plt.xlabel(f"{label_cv1} (A)")
+        plt.ylabel(f"{label_cv2} (A)")
         plt.title("2D Probability Density P(CV1, CV2)")
         prob_handles = []
         if args.overlay_gap and gap_mask is not None:
@@ -623,8 +623,8 @@ def main():
                    vmin=vmin, vmax=vmax)
         fes_label = f"F ({'relative' if not args.absolute_fes else 'absolute'}, {args.units}/mol)"
         plt.colorbar(label=fes_label)
-        plt.xlabel(f"{label_cv1} (distance, A)")
-        plt.ylabel(f"{label_cv2} (distance, A)")
+        plt.xlabel(f"{label_cv1} (A)")
+        plt.ylabel(f"{label_cv2} (A)")
         plt.title("2D Free Energy Surface F(CV1, CV2)")
         plt.tight_layout()
         plt.savefig(os.path.join(fig_dir, f"{out_prefix}{suffix}_fes.png"), dpi=220)
@@ -637,8 +637,8 @@ def main():
                        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                        vmin=vmin, vmax=vmax)
             plt.colorbar(label=fes_label)
-            plt.xlabel(f"{label_cv1} (distance, A)")
-            plt.ylabel(f"{label_cv2} (distance, A)")
+            plt.xlabel(f"{label_cv1} (A)")
+            plt.ylabel(f"{label_cv2} (A)")
             plt.title("2D Free Energy Surface F(CV1, CV2)")
             handles = []
             if contour_percentiles:
@@ -707,8 +707,8 @@ def main():
                        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                        vmin=vmin, vmax=vmax)
             plt.colorbar(label=fes_label)
-            plt.xlabel(f"{label_cv1} (distance, A)")
-            plt.ylabel(f"{label_cv2} (distance, A)")
+            plt.xlabel(f"{label_cv1} (A)")
+            plt.ylabel(f"{label_cv2} (A)")
             plt.title("2D Free Energy Surface + Trajectory Path")
 
             # Build index segments in time order, respecting episode boundaries and d_cut breaks
@@ -861,8 +861,8 @@ def main():
                        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                        vmin=vmin, vmax=vmax)
             plt.colorbar(label=fes_label)
-            plt.xlabel(f"{label_cv1} (distance, A)")
-            plt.ylabel(f"{label_cv2} (distance, A)")
+            plt.xlabel(f"{label_cv1} (A)")
+            plt.ylabel(f"{label_cv2} (A)")
             plt.title("FES + MFEP (reaction corridor)")
 
             start_xy = _parse_pair(args.mfep_start) if args.mfep_start else (float(sub_cv1[0]), float(sub_cv2[0]))

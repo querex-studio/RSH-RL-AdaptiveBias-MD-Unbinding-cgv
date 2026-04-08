@@ -2,6 +2,14 @@
 
 This document covers post-processing analysis after training: trajectory aggregation, episode-surface plotting, and run-level output organization.
 
+For dimensionality reduction and pathway interpretation after post-processing, use [PCA_ANALYSIS.md](./PCA_ANALYSIS.md) and [TICA_ANALYSIS.md](./TICA_ANALYSIS.md).
+
+For automatic `CV2` candidate ranking, use [CV_SELECTION.md](./CV_SELECTION.md).
+
+For TICA-selected restart PDBs and two-pathway F/kT plotting, use [HYBRID_RESTART_SELECTION.md](./HYBRID_RESTART_SELECTION.md).
+
+For automatic PPO rounds guided by PCA/TICA-selected restart states, use [AUTOMATED_HYBRID_TRAINING.md](./AUTOMATED_HYBRID_TRAINING.md).
+
 Primary source files:
 
 - [analysis/post_process.py](../analysis/post_process.py)
@@ -104,9 +112,26 @@ Use post-processing when you need:
 - many trajectories processed together
 - a standard output bundle
 
-## 8. Important Notes
+## 8. Relationship to PCA and TICA
 
-### 8.1 Config-module dependency
+Post-processing organizes CV-space plots and episode-level bias/FES diagnostics. PCA and TICA are separate downstream analyses that read the same DCD outputs and topology:
+
+- PCA: variance-based phosphate-pathway structural modes.
+- TICA: time-lagged slow modes and Adaptive-CVgen-inspired seed-candidate diagnostics.
+- Hybrid restart selection: TICA- or PCA-selected restart PDB export plus two candidate transition pathways on a `free energy / kT` imshow plot.
+
+Recommended order:
+
+1. Run `scripts\post_process.py` to inspect CV-space behavior and episode surfaces.
+2. Run `scripts\cv2_autoselect.py` to rank Mg-phosphate oxygen and pathway CV2 candidates.
+3. Run `scripts\pca.py` to identify dominant phosphate-pathway residue-pair motions and PCA-space restart candidates.
+4. Run `scripts\pca_hybrid_restart.py` to export PCA-space restart PDBs if structural-diversity candidates are useful.
+5. Run `scripts\tica.py` to identify slow modes, TICA clusters, and restart/evaluation candidates.
+6. Run `scripts\hybrid_restart.py` to export restart PDBs and plot two distinct pathway traces from TICA candidates.
+
+## 9. Important Notes
+
+### 9.1 Config-module dependency
 
 The script imports the chosen config module to resolve:
 
@@ -115,15 +140,15 @@ The script imports the chosen config module to resolve:
 - CV atom indices
 - output roots
 
-### 8.2 Legacy metrics support
+### 9.2 Legacy metrics support
 
 The script still contains support for older metrics and FES files. Not every function is central to the current PPO workflow.
 
-### 8.3 Episode-surface plotting dependency
+### 9.3 Episode-surface plotting dependency
 
 Per-episode surface generation depends on episode-level CSV and metadata files being present and consistent.
 
-## 9. Practical Commands
+## 10. Practical Commands
 
 Basic:
 
@@ -147,4 +172,26 @@ Fuller visualization pass:
 
 ```powershell
 python scripts\post_process.py --config-module combined_2d --episode-surfaces --all-trajectories --all-traj-stride 5
+```
+
+Then run CV2 auto-selection and TICA:
+
+```powershell
+python scripts\cv2_autoselect.py --config-module combined_2d --max-traj 0
+```
+
+```powershell
+python scripts\tica.py --config-module combined_2d --max-traj 0 --lag 5
+```
+
+PCA-space hybrid restart export:
+
+```powershell
+python scripts\pca_hybrid_restart.py --config-module combined_2d --max-episode 10 --top-restarts 10
+```
+
+Then run the 10-episode TICA-space hybrid restart test:
+
+```powershell
+python scripts\hybrid_restart.py --config-module combined_2d --max-episode 10 --top-restarts 10
 ```

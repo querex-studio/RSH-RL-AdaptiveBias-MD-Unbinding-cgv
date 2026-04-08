@@ -1,4 +1,5 @@
 import os
+import random
 import numpy as np
 import torch
 import combined_2d as config
@@ -56,9 +57,40 @@ def load_agent_from_episode(ep_idx: int):
     print(f"[resume] Loaded checkpoint from episode {ep_idx}: {ckpt_path}")
     return agent, payload
 
-def train_progressive(n_episodes=400, start_ep=1, agent=None, resume_training_meta=None):
+def _normalize_restart_pool(restart_pool):
+    out = []
+    for idx, item in enumerate(restart_pool or [], start=1):
+        if isinstance(item, dict):
+            pdb_path = item.get("pdb_path") or item.get("path")
+            if not pdb_path:
+                continue
+            row = dict(item)
+        else:
+            pdb_path = str(item)
+            row = {"pdb_path": pdb_path}
+        if not os.path.exists(str(pdb_path)):
+            continue
+        row.setdefault("source_rank", idx)
+        row["pdb_path"] = os.path.abspath(str(pdb_path))
+        out.append(row)
+    return out
+
+
+def train_progressive(
+    n_episodes=400,
+    start_ep=1,
+    agent=None,
+    resume_training_meta=None,
+    restart_pool=None,
+    restart_fraction=0.0,
+    restart_use_final_target=True,
+    hybrid_round=None,
+):
     np.random.seed(config.SEED)
     torch.manual_seed(config.SEED)
+    restart_rng = random.Random(int(config.SEED) + int(start_ep))
+    restart_pool = _normalize_restart_pool(restart_pool)
+    restart_cursor = 0
 
     # re-use agent if passed (for resume), otherwise start from scratch
     if agent is None:
@@ -96,8 +128,18 @@ def train_progressive(n_episodes=400, start_ep=1, agent=None, resume_training_me
             config.ENABLE_MILESTONE_LOCKS = False
             config.IN_ZONE_MAX_AMP = 1e9
 
+        restart_item = None
+        if restart_pool and float(restart_fraction) > 0.0 and restart_rng.random() < float(restart_fraction):
+            restart_item = restart_pool[restart_cursor % len(restart_pool)]
+            restart_cursor += 1
+
         target_center_A = float(curriculum_targets[curriculum_stage])
         target_half_width_A = float(config.curriculum_half_width_for_target(target_center_A))
+        target_stage_for_episode = curriculum_stage
+        if restart_item is not None and restart_use_final_target:
+            target_center_A = float(config.TARGET_CENTER)
+            target_half_width_A = float(getattr(config, "TARGET_ZONE_HALF_WIDTH", config.curriculum_half_width_for_target(target_center_A)))
+            target_stage_for_episode = len(curriculum_targets) - 1
 
         carry_state = not bool(getattr(config, "TRAIN_FRESH_START_EVERY_EPISODE", True))
         state = env.reset(
@@ -106,8 +148,14 @@ def train_progressive(n_episodes=400, start_ep=1, agent=None, resume_training_me
             episode_index=ep_idx,
             target_center_A=target_center_A,
             target_half_width_A=target_half_width_A,
-            target_stage=curriculum_stage,
+            target_stage=target_stage_for_episode,
+            restart_pdb_path=None if restart_item is None else restart_item.get("pdb_path"),
         )
+        if restart_item is not None:
+            print(
+                f"[hybrid-restart] episode {ep_idx:04d} starts from "
+                f"{restart_item.get('pdb_path')} rank={restart_item.get('source_rank', '')}"
+            )
         done = False
         steps = 0
 
@@ -171,13 +219,21 @@ def train_progressive(n_episodes=400, start_ep=1, agent=None, resume_training_me
                 getattr(env, "episode_target_max_A", config.TARGET_MAX),
             ],
             target_stage=getattr(env, "episode_target_stage", None),
+            restart_metadata={
+                "hybrid_round": hybrid_round,
+                "restart_fraction": float(restart_fraction),
+                "restart_source": None if restart_item is None else restart_item,
+            },
         )
 
         stage_success = bool(getattr(env, "episode_target_hit", False))
         episode_stage = int(getattr(env, "episode_target_stage", curriculum_stage))
         episode_target_center = float(getattr(env, "episode_target_center_A", target_center_A))
-        recent_stage_success.append(1.0 if stage_success else 0.0)
+        if restart_item is None:
+            recent_stage_success.append(1.0 if stage_success else 0.0)
         if (
+            restart_item is None
+            and
             curriculum_stage < (len(curriculum_targets) - 1)
             and len(recent_stage_success) == recent_stage_success.maxlen
             and float(np.mean(recent_stage_success)) >= float(getattr(config, "CURRICULUM_PROMOTION_THRESHOLD", 0.75))
@@ -235,6 +291,11 @@ def train_progressive(n_episodes=400, start_ep=1, agent=None, resume_training_me
             )
 
     print("Training complete.")
+    return agent, {
+        "curriculum_stage": int(curriculum_stage),
+        "recent_stage_success": list(recent_stage_success),
+        "curriculum_targets": list(map(float, curriculum_targets)),
+    }
 
 
 if __name__ == "__main__":
@@ -248,7 +309,7 @@ if __name__ == "__main__":
 
     RESUME = False          # True -> resume from checkpoint; False -> start fresh
     resume_ep = 295        # checkpoint episode index to load (only used if RESUME=True)
-    total_target = 50     # total episodes you want to complete in this run
+    total_target = 10     # total episodes you want to complete in this run
 
     if RESUME:
         try:

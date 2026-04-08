@@ -1,14 +1,17 @@
 import json
 import os
 import time
-
-try:
-    import config
-except Exception:
-    config = None
+import importlib
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
+
+
+def _default_config():
+    try:
+        return importlib.import_module("config")
+    except Exception:
+        return None
 
 
 def default_time_tag():
@@ -16,10 +19,11 @@ def default_time_tag():
 
 
 def _resolve_runs_root(root=None):
+    cfg = _default_config()
     if root:
         base = root
     else:
-        base = getattr(config, "RUNS_DIR", "analysis_runs") if config else "analysis_runs"
+        base = getattr(cfg, "RUNS_DIR", "analysis_runs") if cfg else "analysis_runs"
     if not os.path.isabs(base):
         base = os.path.join(ROOT_DIR, base)
     return base
@@ -33,7 +37,8 @@ def prepare_run_dir(time_tag, root=None):
 
 
 def _snapshot_config():
-    if config is None:
+    cfg = _default_config()
+    if cfg is None:
         return {}
     fields = [
         "ATOM1_INDEX", "ATOM2_INDEX", "ATOM3_INDEX", "ATOM4_INDEX",
@@ -44,13 +49,13 @@ def _snapshot_config():
     ]
     snap = {}
     unit_mod = None
-    if hasattr(config, "unit"):
-        unit_mod = config.unit
-    elif hasattr(config, "u"):
-        unit_mod = config.u
+    if hasattr(cfg, "unit"):
+        unit_mod = cfg.unit
+    elif hasattr(cfg, "u"):
+        unit_mod = cfg.u
     for f in fields:
-        if hasattr(config, f):
-            val = getattr(config, f)
+        if hasattr(cfg, f):
+            val = getattr(cfg, f)
             try:
                 if hasattr(val, "value_in_unit") and unit_mod is not None:
                     val = float(val.value_in_unit(unit_mod.picoseconds))
@@ -63,7 +68,8 @@ def _snapshot_config():
 def write_run_metadata(run_dir, meta):
     payload = dict(meta or {})
     payload.setdefault("time_tag", os.path.basename(run_dir))
-    payload.setdefault("config", _snapshot_config())
+    if "config" not in payload:
+        payload["config"] = _snapshot_config()
     out_path = os.path.join(run_dir, "run.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)

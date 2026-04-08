@@ -20,6 +20,8 @@ from analysis.plot_episode_bias_fes import (
     _bias_surface_like_profile,
     _episode_paths,
     _frame_biases,
+    _grid_bias,
+    _axis_label,
     _load_bias_log,
     _load_traj,
 )
@@ -176,7 +178,9 @@ def _compute_episode_layers(episode_num, temperature=300.0, bins=180):
     meta = _load_bias_log(meta_json)
     bias_log = meta.get("bias_log", [])
     target_x = float(meta.get("target_center_A", config.TARGET_CENTER))
-    target_y = float(config.TARGET2_CENTER)
+    target_y = float(meta.get("target2_center_A", config.TARGET2_CENTER))
+    cv1_axis_label = _axis_label(meta, "cv1", getattr(config, "CV1_LABEL", "CV1"))
+    cv2_axis_label = _axis_label(meta, "cv2", getattr(config, "CV2_LABEL", "CV2"))
 
     frame_bias = _frame_biases(cv1, cv2, bias_log)
     beta = 1.0 / (KB_KCAL * float(temperature))
@@ -201,15 +205,7 @@ def _compute_episode_layers(episode_num, temperature=300.0, bins=180):
     # Fill unsampled regions with a high-energy background so the slice remains complete.
     fes[visits <= 0.0] = fes_bg
 
-    Xc, Yc = np.meshgrid(x, y)
-    bias = np.zeros_like(Xc, dtype=float)
-    for _, _, amp_kcal, c1, c2, sx, sy in bias_log:
-        sx = max(1e-6, float(sx))
-        sy = max(1e-6, float(sy))
-        bias += float(amp_kcal) * np.exp(
-            -((Xc - float(c1)) ** 2) / (2.0 * sx * sx)
-            -((Yc - float(c2)) ** 2) / (2.0 * sy * sy)
-        )
+    bias = _grid_bias(x, y, bias_log) if bias_log else np.zeros((len(y), len(x)), dtype=float)
     if np.isfinite(bias).any():
         bias_floor = float(np.nanpercentile(bias[np.isfinite(bias)], 2.0))
         bias = np.maximum(bias, bias_floor)
@@ -227,6 +223,8 @@ def _compute_episode_layers(episode_num, temperature=300.0, bins=180):
         "layer_names": ["Trajectories", "Unbiased FES", "Bias"],
         "target_x": target_x,
         "target_y": target_y,
+        "cv1_axis_label": cv1_axis_label,
+        "cv2_axis_label": cv2_axis_label,
     }
 
 
@@ -240,6 +238,8 @@ def assemble_full_figure(
     target_x,
     target_y,
     time_ps=None,
+    cv1_axis_label=None,
+    cv2_axis_label=None,
     output_path="stacked_episode_slices.png",
     per_layer_norm=False,
     figure_size=(28, 20),
@@ -315,10 +315,10 @@ def assemble_full_figure(
     z_span = max(1.0, float(np.max(z_levels) - np.min(z_levels) + 1.6 * z_spacing))
 
     ax.set_title("Episode stacked slices: trajectories, unbiased FES, and bias", pad=28, fontsize=20)
-    ax.set_xlabel("CV1 (atom 7799 - atom 7840 distance) (Å)", labelpad=18, fontsize=13)
-    ax.set_ylabel("CV2 (atom 487 - atom 3789 distance) (Å)", labelpad=18, fontsize=13)
     ax.set_xlim(float(np.min(x)), float(np.max(x)))
     ax.set_ylim(float(np.min(y)), float(np.max(y)))
+    ax.set_xlabel(cv1_axis_label or getattr(config, "CV1_AXIS_LABEL", f"{config.CV1_LABEL} (A)"), labelpad=18, fontsize=13)
+    ax.set_ylabel(cv2_axis_label or getattr(config, "CV2_AXIS_LABEL", f"{config.CV2_LABEL} (A)"), labelpad=18, fontsize=13)
     ax.set_zlim(float(np.min(z_levels) - 0.38 * z_spacing), float(np.max(z_levels) + 0.46 * z_spacing))
     ax.set_zticks([])
     ax.set_box_aspect((x_span, y_span, 1.75 * z_span))
@@ -380,6 +380,8 @@ def make_episode_plot(episode_num, temperature=300.0, bins=180):
         target_x=payload["target_x"],
         target_y=payload["target_y"],
         time_ps=payload["time_ps"],
+        cv1_axis_label=payload["cv1_axis_label"],
+        cv2_axis_label=payload["cv2_axis_label"],
         output_path=out_path,
         per_layer_norm=False,
         figure_size=(36, 20),

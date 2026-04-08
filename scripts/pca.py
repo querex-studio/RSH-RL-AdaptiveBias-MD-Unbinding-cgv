@@ -2,7 +2,7 @@
 Wrapper entrypoint for phosphate-pathway PCA on PPO trajectories.
 
 Usage:
-  python scripts/pca.py --max-traj 50 --cutoff 6.0 --max-residues 60
+  python scripts/pca.py --config-module combined_2d --max-traj 0 --cutoff 6.0 --max-residues 60
 """
 
 import os

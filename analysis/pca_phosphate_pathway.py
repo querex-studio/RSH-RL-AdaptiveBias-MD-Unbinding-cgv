@@ -24,8 +24,9 @@ except Exception as exc:
 
 try:
     from sklearn.decomposition import IncrementalPCA
+    from sklearn.cluster import MiniBatchKMeans
 except Exception as exc:
-    raise ImportError("scikit-learn is required for phosphate-pathway PCA.") from exc
+    raise ImportError("scikit-learn is required for phosphate-pathway PCA and PCA-space clustering.") from exc
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 if ROOT_DIR not in sys.path:
@@ -163,25 +164,74 @@ def _collect_candidate_residues(top_path, traj_list, phosphate_sel, residue_sel,
                     continue
                 seen.add(key)
                 counts[key] += 1
+                min_dist = float(np.min(distance_array(residue.atoms.positions, phosphate.positions, box=None)))
+                prev_min = residue_meta.get(key, {}).get("min_distance_A")
                 residue_meta[key] = {
                     "segid": key[0],
                     "resid": key[1],
                     "resname": key[2],
                     "label": _residue_label(key),
+                    "min_distance_A": min_dist if prev_min is None else min(float(prev_min), min_dist),
                 }
 
     return counts, residue_meta, total_frames
 
 
-def _rank_residues(counts, residue_meta, max_residues):
-    ranked = sorted(
-        counts.items(),
-        key=lambda kv: (-kv[1], kv[0][0], kv[0][1], kv[0][2]),
+def _select_residues_by_cutoff(counts, residue_meta, initial_cutoff_A, max_residues):
+    selected = sorted(
+        counts.keys(),
+        key=lambda key: (
+            float(residue_meta[key].get("min_distance_A", float("inf"))),
+            key[0],
+            key[1],
+            key[2],
+        ),
     )
-    if max_residues is not None and max_residues > 0:
-        ranked = ranked[:int(max_residues)]
-    residue_keys = [key for key, _ in ranked]
-    return residue_keys, ranked
+    effective_cutoff = float(initial_cutoff_A)
+    selection_mode = "input_cutoff"
+
+    if max_residues is not None and max_residues > 0 and len(selected) > int(max_residues):
+        unique_thresholds = sorted(
+            {
+                float(residue_meta[key].get("min_distance_A", float("inf")))
+                for key in selected
+            },
+            reverse=True,
+        )
+        chosen = None
+        for threshold in unique_thresholds:
+            subset = [
+                key for key in selected
+                if float(residue_meta[key].get("min_distance_A", float("inf"))) <= threshold
+            ]
+            if len(subset) <= int(max_residues):
+                chosen = subset
+                effective_cutoff = float(threshold)
+                selection_mode = "cutoff_adjusted"
+                break
+
+        if chosen is None:
+            chosen = selected[: int(max_residues)]
+            effective_cutoff = float(residue_meta[chosen[-1]].get("min_distance_A", initial_cutoff_A))
+            selection_mode = "cutoff_adjusted_tie_trim"
+        selected = chosen
+
+    ranked = [
+        (
+            key,
+            {
+                "contact_frames": int(counts[key]),
+                "min_distance_A": float(residue_meta[key].get("min_distance_A", float("inf"))),
+            },
+        )
+        for key in selected
+    ]
+    return selected, ranked, effective_cutoff, selection_mode
+
+
+def _pc_axis_label(index, explained):
+    frac = float(explained[index]) if index < len(explained) else 0.0
+    return f"PC{index + 1} ({100.0 * frac:.1f}% variance)"
 
 
 def _build_residue_groups(u, residue_keys, repr_mode):
@@ -255,13 +305,32 @@ def _plot_scree(out_path, explained):
     plt.plot(x, explained, marker="o")
     plt.xlabel("Component")
     plt.ylabel("Explained variance ratio")
-    plt.title("Phosphate-Pathway PCA Scree")
+    pc12 = float(np.sum(explained[:2])) if len(explained) >= 2 else float(np.sum(explained[:1]))
+    plt.title(f"Phosphate-Pathway PCA Scree | PC1+PC2={100.0 * pc12:.1f}%")
     plt.tight_layout()
     plt.savefig(out_path, dpi=220)
     plt.close()
 
 
-def _plot_fes(out_path, scores, bins):
+def _plot_pc1_pc2_variance(out_path, explained):
+    pc1 = float(explained[0]) if len(explained) > 0 else 0.0
+    pc2 = float(explained[1]) if len(explained) > 1 else 0.0
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    labels = ["PC1", "PC2", "PC1+PC2"]
+    values = [100.0 * pc1, 100.0 * pc2, 100.0 * (pc1 + pc2)]
+    colors = ["#1d4e89", "#2a9d8f", "#d62828"]
+    bars = ax.bar(labels, values, color=colors, alpha=0.9)
+    ax.set_ylabel("Variance captured (%)")
+    ax.set_ylim(0.0, max(5.0, 1.15 * max(values)))
+    ax.set_title("PC1/PC2 variance capture")
+    for bar, value in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2.0, value + 0.8, f"{value:.1f}%", ha="center", va="bottom", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def _plot_fes(out_path, scores, bins, explained):
     x = scores[:, 0]
     y = scores[:, 1]
     hist, xedges, yedges = np.histogram2d(x, y, bins=bins, density=False)
@@ -281,9 +350,9 @@ def _plot_fes(out_path, scores, bins):
     mesh = ax.pcolormesh(xgrid, ygrid, np.ma.masked_invalid(fes.T), shading="auto", cmap="YlGnBu_r")
     cbar = fig.colorbar(mesh, ax=ax)
     cbar.set_label("Relative FES")
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    ax.set_title("Phosphate-Pathway PCA FES")
+    ax.set_xlabel(_pc_axis_label(0, explained))
+    ax.set_ylabel(_pc_axis_label(1, explained))
+    ax.set_title(f"Phosphate-Pathway PCA FES | PC1+PC2={100.0 * float(np.sum(explained[:2])):.1f}%")
     fig.tight_layout()
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
@@ -294,7 +363,7 @@ def _time_colored_segments(x, y, t):
     return np.concatenate([pts[:-1], pts[1:]], axis=1), Normalize(vmin=float(np.min(t)), vmax=float(np.max(t)))
 
 
-def _plot_per_traj_projection(out_path, scores, time_ps, title):
+def _plot_per_traj_projection(out_path, scores, time_ps, title, explained):
     fig, ax = plt.subplots(figsize=(6.8, 5.8))
     if len(scores) > 1:
         segs, norm = _time_colored_segments(scores[:, 0], scores[:, 1], time_ps)
@@ -310,8 +379,8 @@ def _plot_per_traj_projection(out_path, scores, time_ps, title):
 
     ax.scatter([scores[0, 0]], [scores[0, 1]], s=70, color="#2a9d8f", edgecolor="white", linewidth=0.8, label="Start", zorder=4)
     ax.scatter([scores[-1, 0]], [scores[-1, 1]], s=75, color="#f4a261", edgecolor="white", linewidth=0.8, label="Final", zorder=4)
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
+    ax.set_xlabel(_pc_axis_label(0, explained))
+    ax.set_ylabel(_pc_axis_label(1, explained))
     ax.set_title(title)
     ax.legend(loc="best", frameon=True)
     fig.tight_layout()
@@ -319,11 +388,11 @@ def _plot_per_traj_projection(out_path, scores, time_ps, title):
     plt.close(fig)
 
 
-def _plot_per_traj_timeseries(out_path, scores, time_ps, title):
+def _plot_per_traj_timeseries(out_path, scores, time_ps, title, explained):
     fig, ax = plt.subplots(figsize=(8.0, 4.6))
-    ax.plot(time_ps, scores[:, 0], label="PC1", linewidth=1.4)
+    ax.plot(time_ps, scores[:, 0], label=_pc_axis_label(0, explained), linewidth=1.4)
     if scores.shape[1] > 1:
-        ax.plot(time_ps, scores[:, 1], label="PC2", linewidth=1.2)
+        ax.plot(time_ps, scores[:, 1], label=_pc_axis_label(1, explained), linewidth=1.2)
     ax.set_xlabel("Time (ps)")
     ax.set_ylabel("Score")
     ax.set_title(title)
@@ -333,7 +402,7 @@ def _plot_per_traj_timeseries(out_path, scores, time_ps, title):
     plt.close(fig)
 
 
-def _plot_all_traj_projection(out_path, traj_series, title):
+def _plot_all_traj_projection(out_path, traj_series, title, explained):
     fig, ax = plt.subplots(figsize=(8.4, 6.8))
     n_traj = len(traj_series)
     if n_traj <= 10:
@@ -350,8 +419,8 @@ def _plot_all_traj_projection(out_path, traj_series, title):
         ax.plot(x, y, color=color, linewidth=1.0, alpha=0.8, label=traj_label, zorder=2)
         ax.scatter([x[0]], [y[0]], s=16, color=color, edgecolor="white", linewidth=0.4, alpha=0.95, zorder=3)
 
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
+    ax.set_xlabel(_pc_axis_label(0, explained))
+    ax.set_ylabel(_pc_axis_label(1, explained))
     ax.set_title(title)
     ax.grid(alpha=0.18, linewidth=0.5)
     if n_traj <= 24:
@@ -459,6 +528,229 @@ def _component_definition_text(component_name, records, corr_cv1, corr_cv2, top_
     return " ".join(parts)
 
 
+def _norm01(values):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return values
+    lo = np.nanmin(values)
+    hi = np.nanmax(values)
+    if not np.isfinite(lo) or not np.isfinite(hi) or abs(hi - lo) < 1e-12:
+        return np.zeros_like(values)
+    return np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _progress_terms(cfg, cv1, cv2):
+    start1 = float(getattr(cfg, "CURRENT_DISTANCE", np.nan))
+    target1 = float(getattr(cfg, "FINAL_TARGET", getattr(cfg, "TARGET_CENTER", np.nan)))
+    if np.isfinite(start1) and np.isfinite(target1) and abs(target1 - start1) > 1e-12:
+        p1 = np.clip((cv1 - start1) / (target1 - start1), 0.0, 1.0)
+    else:
+        p1 = _norm01(cv1)
+
+    start2 = float(getattr(cfg, "CURRENT_DISTANCE2", np.nan))
+    target2 = float(getattr(cfg, "FINAL_TARGET2", getattr(cfg, "TARGET2_CENTER", np.nan)))
+    direction2 = str(getattr(cfg, "CV2_PROGRESS_DIRECTION", "decrease")).strip().lower()
+    if np.isfinite(start2) and np.isfinite(target2) and abs(target2 - start2) > 1e-12:
+        if direction2 == "increase":
+            p2 = np.clip((cv2 - start2) / (target2 - start2), 0.0, 1.0)
+        else:
+            p2 = np.clip((start2 - cv2) / (start2 - target2), 0.0, 1.0)
+    else:
+        p2 = _norm01(cv2) if direction2 == "increase" else 1.0 - _norm01(cv2)
+    return p1, p2
+
+
+def _cluster_scores(scores_2d, n_clusters, seed):
+    if len(scores_2d) < 2 or n_clusters <= 1:
+        labels = np.zeros(len(scores_2d), dtype=int)
+        centers = np.mean(scores_2d, axis=0, keepdims=True)
+        return labels, centers
+    k = int(min(max(2, n_clusters), len(scores_2d)))
+    model = MiniBatchKMeans(
+        n_clusters=k,
+        random_state=int(seed),
+        batch_size=min(4096, max(128, k * 4)),
+        n_init=10,
+        max_iter=200,
+    )
+    labels = model.fit_predict(scores_2d)
+    return labels.astype(int), np.asarray(model.cluster_centers_, dtype=np.float64)
+
+
+def _pca_candidate_rows(rows, scores_2d, labels, cfg, args):
+    cv1 = np.asarray([float(row["cv1_A"]) for row in rows], dtype=np.float64)
+    cv2 = np.asarray([float(row["cv2_A"]) for row in rows], dtype=np.float64)
+    p1, p2 = _progress_terms(cfg, cv1, cv2)
+    counts = Counter(map(int, labels))
+    rarity = np.asarray([1.0 / np.sqrt(max(1, counts[int(label)])) for label in labels], dtype=np.float64)
+    novelty = _norm01(rarity)
+    initial = scores_2d[0]
+    displacement = np.linalg.norm(scores_2d - initial[None, :], axis=1)
+    displacement_norm = _norm01(displacement)
+    score = (
+        float(args.progress_weight) * p1
+        + float(args.cv2_weight) * p2
+        + float(args.novelty_weight) * novelty
+        + float(args.structural_mode_weight) * displacement_norm
+    )
+
+    enriched = []
+    for idx, row in enumerate(rows):
+        out = dict(row)
+        out["cluster"] = int(labels[idx])
+        out["adaptive_score"] = float(score[idx])
+        out["cv1_progress"] = float(p1[idx])
+        out["cv2_progress"] = float(p2[idx])
+        out["novelty"] = float(novelty[idx])
+        out["pca_mode_distance"] = float(displacement_norm[idx])
+        enriched.append(out)
+
+    enriched.sort(key=lambda row: float(row["adaptive_score"]), reverse=True)
+    if int(args.per_cluster_candidates) > 0:
+        kept = []
+        per_cluster_counts = Counter()
+        for row in enriched:
+            cluster = int(row["cluster"])
+            if per_cluster_counts[cluster] >= int(args.per_cluster_candidates):
+                continue
+            per_cluster_counts[cluster] += 1
+            kept.append(row)
+            if len(kept) >= int(args.top_candidates):
+                break
+    else:
+        kept = enriched[: int(args.top_candidates)]
+    return kept, score
+
+
+def _write_pca_candidate_csv(path, candidate_rows):
+    fieldnames = [
+        "rank", "traj", "traj_path", "frame_idx", "time_ps", "cv1_A", "cv2_A", "PC1", "PC2",
+        "cluster", "adaptive_score", "cv1_progress", "cv2_progress", "novelty", "pca_mode_distance",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for rank, row in enumerate(candidate_rows, start=1):
+            out = {key: row.get(key, "") for key in fieldnames}
+            out["rank"] = rank
+            writer.writerow(out)
+
+
+def _plot_pca_candidates(out_path, scores_2d, labels, candidate_rows, explained):
+    fig, ax = plt.subplots(figsize=(8.0, 6.5))
+    sc = ax.scatter(scores_2d[:, 0], scores_2d[:, 1], c=labels, cmap="tab20", s=10, alpha=0.55)
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("PCA-space cluster")
+    if candidate_rows:
+        x = [float(row["PC1"]) for row in candidate_rows]
+        y = [float(row["PC2"]) for row in candidate_rows]
+        ax.scatter(x, y, marker="*", s=130, color="#d62828", edgecolor="white", linewidth=0.8, label="Restart candidates")
+        for idx, row in enumerate(candidate_rows[: min(10, len(candidate_rows))], start=1):
+            ax.annotate(str(idx), (float(row["PC1"]), float(row["PC2"])), xytext=(5, 5), textcoords="offset points", fontsize=8, color="#d62828")
+    ax.set_xlabel(_pc_axis_label(0, explained))
+    ax.set_ylabel(_pc_axis_label(1, explained))
+    ax.set_title("PCA-space clusters and restart candidates")
+    ax.legend(loc="best", frameon=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def _plot_pca_score_map(out_path, scores_2d, adaptive_score, explained):
+    fig, ax = plt.subplots(figsize=(7.5, 6.4))
+    sc = ax.scatter(scores_2d[:, 0], scores_2d[:, 1], c=adaptive_score, cmap="magma", s=12, alpha=0.75)
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("PCA adaptive candidate score")
+    ax.set_xlabel(_pc_axis_label(0, explained))
+    ax.set_ylabel(_pc_axis_label(1, explained))
+    ax.set_title("PCA-space Adaptive-CVgen-style candidate score")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def _tica_like_distance(row_a, row_b, x_key="PC1", y_key="PC2"):
+    dx = float(row_a.get(x_key, 0.0)) - float(row_b.get(x_key, 0.0))
+    dy = float(row_a.get(y_key, 0.0)) - float(row_b.get(y_key, 0.0))
+    return float(np.sqrt(dx * dx + dy * dy))
+
+
+def _select_two_pca_pathways(candidate_rows):
+    valid = [row for row in candidate_rows if np.isfinite(float(row.get("PC1", np.nan))) and np.isfinite(float(row.get("PC2", np.nan)))]
+    if not valid:
+        return [], "no_valid_pca_coordinates"
+    if len(valid) == 1:
+        return [valid[0]], "single_candidate"
+    first = valid[0]
+    different_cluster = [row for row in valid[1:] if row.get("cluster") != first.get("cluster")]
+    pool = different_cluster if different_cluster else valid[1:]
+    second = max(pool, key=lambda row: _tica_like_distance(first, row, "PC1", "PC2"))
+    mode = "different_cluster" if different_cluster else "max_pc_separation"
+    return [first, second], mode
+
+
+def _pathway_rows_for_endpoint(rows, endpoint):
+    traj = endpoint.get("traj")
+    frame = int(endpoint.get("frame_idx", 0))
+    out = [
+        row for row in rows
+        if row.get("traj") == traj
+        and int(row.get("frame_idx", 0)) <= frame
+        and np.isfinite(float(row.get("PC1", np.nan)))
+        and np.isfinite(float(row.get("PC2", np.nan)))
+    ]
+    out.sort(key=lambda row: int(row.get("frame_idx", 0)))
+    return out
+
+
+def _plot_pca_two_pathways_fkT(out_path, rows, candidate_rows, explained, bins):
+    endpoints, mode = _select_two_pca_pathways(candidate_rows)
+    x = np.asarray([float(row["PC1"]) for row in rows], dtype=float)
+    y = np.asarray([float(row["PC2"]) for row in rows], dtype=float)
+    if len(x) < 2:
+        return mode
+    hist, xedges, yedges = np.histogram2d(x, y, bins=int(bins))
+    prob = hist / max(1.0, float(np.sum(hist)))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fkT = -np.log(prob)
+    finite = np.isfinite(fkT)
+    if np.any(finite):
+        fkT[finite] -= np.nanmin(fkT[finite])
+    fkT[~finite] = np.nan
+
+    fig, ax = plt.subplots(figsize=(9.0, 7.0))
+    image = ax.imshow(
+        fkT.T,
+        origin="lower",
+        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+        aspect="auto",
+        cmap="viridis",
+        interpolation="nearest",
+    )
+    cbar = fig.colorbar(image, ax=ax)
+    cbar.set_label("Free energy / kT")
+    colors = ["#d62828", "#1d4e89"]
+    for idx, endpoint in enumerate(endpoints, start=1):
+        pathway = _pathway_rows_for_endpoint(rows, endpoint)
+        if not pathway:
+            continue
+        px = [float(row["PC1"]) for row in pathway]
+        py = [float(row["PC2"]) for row in pathway]
+        color = colors[(idx - 1) % len(colors)]
+        ax.plot(px, py, color=color, linewidth=2.4, alpha=0.9, label=f"Pathway {idx}")
+        ax.scatter([px[0]], [py[0]], color=color, marker="o", s=42, edgecolor="white", linewidth=0.7)
+        ax.scatter([px[-1]], [py[-1]], color=color, marker="*", s=140, edgecolor="white", linewidth=0.7)
+        ax.annotate(f"P{idx}", (px[-1], py[-1]), xytext=(6, 6), textcoords="offset points", color=color, fontsize=9, weight="bold")
+    ax.set_xlabel(_pc_axis_label(0, explained))
+    ax.set_ylabel(_pc_axis_label(1, explained))
+    ax.set_title(f"PCA two transition pathways on F/kT map ({mode})")
+    ax.legend(loc="best", frameon=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    return mode
+
+
 def main():
     parser = argparse.ArgumentParser(description="PCA on phosphate-pathway residue-pair distances.")
     parser.add_argument("--config-module", default=None, help="Config module to use.")
@@ -473,12 +765,19 @@ def main():
     parser.add_argument("--cutoff", type=float, default=6.0, help="Residue-phosphate cutoff in Å.")
     parser.add_argument("--contact-stride", type=int, default=1, help="Stride for residue-discovery pass.")
     parser.add_argument("--stride", type=int, default=1, help="Stride for PCA passes.")
-    parser.add_argument("--max-residues", type=int, default=60, help="Keep the top-contact residues if exceeded.")
+    parser.add_argument("--max-residues", type=int, default=60, help="Tighten the phosphate cutoff until at most this many residues remain.")
     parser.add_argument("--residue-repr", choices=["com", "ca"], default="com", help="Residue position representation.")
     parser.add_argument("--n-components", type=int, default=6, help="Number of PCA components.")
     parser.add_argument("--batch-size", type=int, default=2000, help="IncrementalPCA batch size.")
     parser.add_argument("--bins", type=int, default=60, help="Bins for global PC1/PC2 FES.")
+    parser.add_argument("--clusters", type=int, default=12, help="PCA-space clusters for restart-candidate analysis.")
+    parser.add_argument("--top-candidates", type=int, default=30, help="Number of PCA restart-candidate rows to write.")
+    parser.add_argument("--per-cluster-candidates", type=int, default=3, help="Max candidates per PCA cluster; <=0 disables the cap.")
     parser.add_argument("--top-loadings", type=int, default=12, help="Top signed residue-pair loadings to plot per component.")
+    parser.add_argument("--progress-weight", type=float, default=1.0, help="Weight for CV1 unbinding progress in PCA candidate scoring.")
+    parser.add_argument("--cv2-weight", type=float, default=0.35, help="Weight for CV2 progress in PCA candidate scoring.")
+    parser.add_argument("--novelty-weight", type=float, default=0.25, help="Weight for PCA cluster rarity in candidate scoring.")
+    parser.add_argument("--structural-mode-weight", type=float, default=0.25, help="Weight for PC1/PC2 displacement from the initial point.")
     parser.add_argument("--run", default=None, help="Existing analysis run directory.")
     parser.add_argument("--runs-root", default=None, help="Root folder for analysis_runs.")
     parser.add_argument("--atom1", type=int, default=None, help="CV1 atom1 override.")
@@ -535,7 +834,12 @@ def main():
     if not counts:
         raise RuntimeError("No protein residues were found near the phosphate selection.")
 
-    residue_keys, ranked = _rank_residues(counts, residue_meta, args.max_residues)
+    residue_keys, ranked, effective_cutoff_A, selection_mode = _select_residues_by_cutoff(
+        counts,
+        residue_meta,
+        args.cutoff,
+        args.max_residues,
+    )
     if len(residue_keys) < 2:
         raise RuntimeError("Need at least two residues for pair-distance PCA.")
 
@@ -545,6 +849,8 @@ def main():
     atom2 = int(args.atom2 if args.atom2 is not None else getattr(cfg, "ATOM2_INDEX", 0))
     atom3 = int(args.atom3 if args.atom3 is not None else getattr(cfg, "ATOM3_INDEX", 0))
     atom4 = int(args.atom4 if args.atom4 is not None else getattr(cfg, "ATOM4_INDEX", 0))
+    cv1_axis_label = getattr(cfg, "CV1_AXIS_LABEL", f"{getattr(cfg, 'CV1_LABEL', 'CV1')} (A)")
+    cv2_axis_label = getattr(cfg, "CV2_AXIS_LABEL", f"{getattr(cfg, 'CV2_LABEL', 'CV2')} (A)")
     dt_ps = _dt_ps_from_cfg(cfg, args.stride)
 
     data_dir = os.path.join(run_dir, "data")
@@ -554,10 +860,19 @@ def main():
     residue_csv = os.path.join(data_dir, "phosphate_pathway_residues.csv")
     with open(residue_csv, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["rank", "segid", "resid", "resname", "label", "contact_frames"])
-        for rank, (key, count) in enumerate(ranked, start=1):
+        writer.writerow(["rank", "segid", "resid", "resname", "label", "contact_frames", "min_distance_A", "selection_mode"])
+        for rank, (key, stats) in enumerate(ranked, start=1):
             meta = residue_meta[key]
-            writer.writerow([rank, meta["segid"], meta["resid"], meta["resname"], meta["label"], int(count)])
+            writer.writerow([
+                rank,
+                meta["segid"],
+                meta["resid"],
+                meta["resname"],
+                meta["label"],
+                int(stats["contact_frames"]),
+                float(stats["min_distance_A"]),
+                selection_mode,
+            ])
 
     pair_csv = os.path.join(data_dir, "phosphate_pathway_pairs.csv")
     with open(pair_csv, "w", newline="", encoding="utf-8") as fh:
@@ -617,23 +932,35 @@ def main():
         per_csv = os.path.join(data_dir, f"{traj_label}_pc_scores.csv")
         with open(per_csv, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
-            header = ["traj", "frame_idx", "time_ps", "cv1_A", "cv2_A"] + [f"PC{i+1}" for i in range(traj_scores.shape[1])]
+            header = ["traj", "traj_path", "frame_idx", "time_ps", "cv1_A", "cv2_A"] + [f"PC{i+1}" for i in range(traj_scores.shape[1])]
             writer.writerow(header)
             for idx, (row, meta) in enumerate(zip(traj_scores, frame_info)):
-                writer.writerow([traj_label, meta["frame_idx"], float(time_ps[idx]), meta["cv1_A"], meta["cv2_A"], *map(float, row)])
-                frame_rows.append([traj_label, meta["frame_idx"], float(time_ps[idx]), meta["cv1_A"], meta["cv2_A"], *map(float, row)])
+                row_dict = {
+                    "traj": traj_label,
+                    "traj_path": os.path.abspath(traj_path),
+                    "frame_idx": int(meta["frame_idx"]),
+                    "time_ps": float(time_ps[idx]),
+                    "cv1_A": float(meta["cv1_A"]),
+                    "cv2_A": float(meta["cv2_A"]),
+                }
+                for comp_i, value in enumerate(row, start=1):
+                    row_dict[f"PC{comp_i}"] = float(value)
+                writer.writerow([row_dict[key] for key in header])
+                frame_rows.append(row_dict)
 
         _plot_per_traj_projection(
             os.path.join(per_traj_dir, f"{traj_label}_pc1_pc2_time.png"),
             traj_scores[:, :2],
             time_ps,
             title=f"{traj_label} | PC1 vs PC2",
+            explained=pca.explained_variance_ratio_,
         )
         _plot_per_traj_timeseries(
             os.path.join(per_traj_dir, f"{traj_label}_pc_timeseries.png"),
             traj_scores,
             time_ps,
             title=f"{traj_label} | PCA scores",
+            explained=pca.explained_variance_ratio_,
         )
         scores_all.append(traj_scores)
         traj_series.append((traj_label, traj_scores[:, :2]))
@@ -642,9 +969,8 @@ def main():
         raise RuntimeError("No trajectory scores were produced.")
 
     scores = np.vstack(scores_all)
-    frame_rows_arr = np.asarray(frame_rows, dtype=object)
-    cv1_all = np.asarray(frame_rows_arr[:, 3], dtype=np.float64)
-    cv2_all = np.asarray(frame_rows_arr[:, 4], dtype=np.float64)
+    cv1_all = np.asarray([row["cv1_A"] for row in frame_rows], dtype=np.float64)
+    cv2_all = np.asarray([row["cv2_A"] for row in frame_rows], dtype=np.float64)
     np.save(os.path.join(data_dir, "phosphate_pathway_mean.npy"), mean_vec)
     np.save(os.path.join(data_dir, "phosphate_pathway_components.npy"), pca.components_)
     np.save(os.path.join(data_dir, "phosphate_pathway_explained.npy"), pca.explained_variance_ratio_)
@@ -652,19 +978,55 @@ def main():
 
     pooled_csv = os.path.join(data_dir, "phosphate_pathway_scores_all.csv")
     with open(pooled_csv, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        header = ["traj", "frame_idx", "time_ps", "cv1_A", "cv2_A"] + [f"PC{i+1}" for i in range(scores.shape[1])]
-        writer.writerow(header)
+        header = ["traj", "traj_path", "frame_idx", "time_ps", "cv1_A", "cv2_A"] + [f"PC{i+1}" for i in range(scores.shape[1])]
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
         writer.writerows(frame_rows)
 
     _plot_scree(os.path.join(fig_dir, "phosphate_pathway_pca_scree.png"), pca.explained_variance_ratio_)
+    _plot_pc1_pc2_variance(os.path.join(fig_dir, "phosphate_pathway_pc1_pc2_variance.png"), pca.explained_variance_ratio_)
     if scores.shape[1] >= 2:
-        _plot_fes(os.path.join(fig_dir, "phosphate_pathway_pca_fes.png"), scores[:, :2], bins=int(args.bins))
+        _plot_fes(
+            os.path.join(fig_dir, "phosphate_pathway_pca_fes.png"),
+            scores[:, :2],
+            bins=int(args.bins),
+            explained=pca.explained_variance_ratio_,
+        )
         _plot_all_traj_projection(
             os.path.join(fig_dir, "phosphate_pathway_pc1_pc2_all_trajectories.png"),
             traj_series,
             title="Phosphate-Pathway PCA | PC1 vs PC2 (all trajectories)",
+            explained=pca.explained_variance_ratio_,
         )
+        labels, centers = _cluster_scores(scores[:, :2], int(args.clusters), int(args.seed))
+        candidate_rows, adaptive_score = _pca_candidate_rows(frame_rows, scores[:, :2], labels, cfg, args)
+        np.save(os.path.join(data_dir, "phosphate_pathway_pca_cluster_centers.npy"), centers)
+        np.save(os.path.join(data_dir, "phosphate_pathway_pca_cluster_labels.npy"), labels)
+        np.save(os.path.join(data_dir, "phosphate_pathway_pca_adaptive_score.npy"), adaptive_score)
+        _write_pca_candidate_csv(os.path.join(data_dir, "pca_adaptive_seed_candidates.csv"), candidate_rows)
+        _plot_pca_candidates(
+            os.path.join(fig_dir, "pca_clusters_seed_candidates.png"),
+            scores[:, :2],
+            labels,
+            candidate_rows,
+            pca.explained_variance_ratio_,
+        )
+        _plot_pca_score_map(
+            os.path.join(fig_dir, "pca_adaptive_score_map.png"),
+            scores[:, :2],
+            adaptive_score,
+            pca.explained_variance_ratio_,
+        )
+        pca_pathway_mode = _plot_pca_two_pathways_fkT(
+            os.path.join(fig_dir, "pca_two_transition_pathways_f_over_kT.png"),
+            frame_rows,
+            candidate_rows,
+            pca.explained_variance_ratio_,
+            int(args.bins),
+        )
+    else:
+        candidate_rows = []
+        pca_pathway_mode = "not_available_less_than_two_components"
 
     component_summaries = []
     for pc_i in range(min(2, pca.components_.shape[0])):
@@ -687,18 +1049,19 @@ def main():
             scores[:, pc_i],
             cv1_all,
             component_name,
-            "CV1 (Å)",
+            cv1_axis_label,
         )
         corr_cv2 = _plot_pc_vs_cv(
             os.path.join(fig_dir, f"{component_name.lower()}_vs_cv2.png"),
             scores[:, pc_i],
             cv2_all,
             component_name,
-            "CV2 (Å)",
+            cv2_axis_label,
         )
         component_summaries.append(
             {
                 "component": component_name,
+                "variance_ratio": float(pca.explained_variance_ratio_[pc_i]),
                 "corr_cv1": None if not np.isfinite(corr_cv1) else float(corr_cv1),
                 "corr_cv2": None if not np.isfinite(corr_cv2) else float(corr_cv2),
                 "top_pairs": records_sorted[: int(min(10, len(records_sorted)))],
@@ -714,11 +1077,18 @@ def main():
         "trajectory_count": int(len(traj_list)),
         "phosphate_sel": args.phosphate_sel,
         "residue_sel": args.residue_sel,
-        "cutoff_A": float(args.cutoff),
+        "input_cutoff_A": float(args.cutoff),
+        "effective_cutoff_A": float(effective_cutoff_A),
+        "selection_mode": selection_mode,
         "residue_repr": args.residue_repr,
         "explained_variance_ratio": [float(x) for x in pca.explained_variance_ratio_],
+        "pc1_variance_pct": 100.0 * float(pca.explained_variance_ratio_[0]) if len(pca.explained_variance_ratio_) > 0 else 0.0,
+        "pc2_variance_pct": 100.0 * float(pca.explained_variance_ratio_[1]) if len(pca.explained_variance_ratio_) > 1 else 0.0,
+        "pc1_pc2_variance_pct": 100.0 * float(np.sum(pca.explained_variance_ratio_[:2])),
         "selected_residues": [residue_meta[key] | {"contact_frames": int(counts[key])} for key in residue_keys],
         "component_summaries": component_summaries,
+        "pca_candidate_count": int(len(candidate_rows)),
+        "pca_two_pathway_mode": pca_pathway_mode,
     }
     with open(os.path.join(data_dir, "phosphate_pathway_summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
@@ -732,18 +1102,38 @@ def main():
         fh.write(f"- Residue-pair features: {n_features}\n")
         fh.write(f"- Phosphate selection: `{args.phosphate_sel}`\n")
         fh.write(f"- Residue representation: `{args.residue_repr}`\n")
+        fh.write(f"- Input cutoff (A): {float(args.cutoff):.3f}\n")
+        fh.write(f"- Effective cutoff (A): {float(effective_cutoff_A):.3f}\n")
+        fh.write(f"- Selection mode: `{selection_mode}`\n")
+        fh.write(f"- PCA restart candidates: {len(candidate_rows)}\n")
+        fh.write(f"- PCA two-pathway selection mode: `{pca_pathway_mode}`\n")
         fh.write("\n## Explained Variance\n\n")
         for i, value in enumerate(pca.explained_variance_ratio_, start=1):
-            fh.write(f"- PC{i}: {float(value):.6f}\n")
+            fh.write(f"- PC{i}: {float(value):.6f} ({100.0 * float(value):.2f}%)\n")
+        fh.write(f"- PC1+PC2 cumulative: {100.0 * float(np.sum(pca.explained_variance_ratio_[:2])):.2f}%\n")
         fh.write("\n## PC Definitions\n\n")
         for comp in component_summaries:
             fh.write(f"### {comp['component']}\n\n")
+            fh.write(f"- Variance captured: {100.0 * float(comp['variance_ratio']):.2f}%\n\n")
             fh.write(comp["definition"] + "\n\n")
             fh.write("| Pair | Loading |\n")
             fh.write("|---|---:|\n")
             for rec in comp["top_pairs"][:6]:
                 fh.write(f"| {rec['pair_label']} | {rec['loading']:.6f} |\n")
             fh.write("\n")
+        fh.write("## PCA-Space Restart Candidates\n\n")
+        fh.write("Candidate scoring mirrors the TICA restart diagnostic but uses PC1/PC2 displacement and PCA-space cluster rarity instead of slow-mode displacement.\n\n")
+        fh.write("```text\n")
+        fh.write("score = progress_weight * CV1_progress\n")
+        fh.write("      + cv2_weight * CV2_progress\n")
+        fh.write("      + novelty_weight * PCA_cluster_rarity\n")
+        fh.write("      + structural_mode_weight * PC1_PC2_displacement_from_initial\n")
+        fh.write("```\n\n")
+        fh.write("Key outputs:\n\n")
+        fh.write("- `pca_adaptive_seed_candidates.csv`\n")
+        fh.write("- `pca_clusters_seed_candidates.png`\n")
+        fh.write("- `pca_adaptive_score_map.png`\n")
+        fh.write("- `pca_two_transition_pathways_f_over_kT.png`\n")
 
     run_utils.cleanup_empty_dirs(run_dir)
     print(f"Saved phosphate-pathway PCA run: {run_dir}")

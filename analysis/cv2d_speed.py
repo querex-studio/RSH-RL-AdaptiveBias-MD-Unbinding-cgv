@@ -249,8 +249,8 @@ def main():
     plt.figure(figsize=(6, 5))
     sc = plt.scatter(cv1_mid, cv2_mid, c=speed, s=args.point_size, alpha=args.point_alpha, cmap=args.cmap, linewidths=0)
     plt.colorbar(sc, label="speed (CV units / time)")
-    plt.xlabel(f"{label_cv1} (distance, A)")
-    plt.ylabel(f"{label_cv2} (distance, A)")
+    plt.xlabel(f"{label_cv1} (A)")
+    plt.ylabel(f"{label_cv2} (A)")
     plt.title("CV1 vs CV2 Colored by Speed")
     spike_threshold = None
     if args.spike_min_speed is not None:
